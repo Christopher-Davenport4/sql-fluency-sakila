@@ -273,9 +273,151 @@ SELECT f1.title AS f1_title, f2.title AS f2_title, f1.length
 --             EXISTS, NOT EXISTS, derived table in FROM
 -- -------------------------------------------------------------
 
+-- The following code returns the titles in the title column and the rental rate from
+-- the rental_rate column where the rental rates are higher than the average rate.
+-- In order to know what the average rental rate is, a subquery was used in the comparison
+-- logic. This subquery finds the rental rate averages for all the films, and then the 
+-- main query uses this value for the comparison logic in the WHERE clause. NOTE: the 
+-- special thing learned from this scalar subquery is that the logic within () is only computed
+-- once since the average of the table is not going to change
+SELECT title, rental_rate
+FROM film 
+WHERE rental_rate > (SELECT AVG(rental_rate) FROM film);
+
+-- The following code returns the first and last names of customers who live in a city located in
+-- India. The logic is split across two levels. The subquery answers one self-contained question:
+-- which city_ids belong to cities in India? It joins city to country and returns that list of
+-- city_ids. The main query then connects each customer to their address (customer holds address_id,
+-- and address holds the city_id) and uses IN to keep only the customers whose city_id appears in the
+-- India list. The subquery returns city_id rather than address_id because "being in India" is a
+-- property of a city, so the subquery answers the question at the level where the filter actually
+-- lives. The country is matched with = 'India' (exact match, correct casing) rather than LIKE, since
+-- LIKE without a wildcard is just a disguised equality and relying on lowercase 'india' would fail
+-- under a case-sensitive collation.
+SELECT c.first_name, c.last_name
+    FROM customer AS c
+    JOIN address AS a ON a.address_id = c.address_id
+    WHERE a.city_id IN (
+        SELECT ci.city_id
+        FROM city AS ci
+        JOIN country AS co ON co.country_id = ci.country_id
+        WHERE co.country = 'India'
+    );
+-- or 
+SELECT first_name, last_name
+	FROM customer
+    WHERE address_id IN (
+		SELECT a.address_id
+		FROM address as a
+		JOIN city as ci ON ci.city_id = a.city_id
+		JOIN country as co ON co.country_id = ci.country_id
+		WHERE co.country LIKE 'India');
+
+-- The following code returns the title, rental rate, and rating of every film whose rental rate is
+-- greater than the average rental rate of films sharing its own rating. For example, a PG film is
+-- compared against the PG average and an R film against the R average. This requires a correlated
+-- subquery, meaning the inner query references f1.rating from the outer query, so it cannot run on
+-- its own and instead re-runs once per outer film, each time using that film's rating. The subquery's
+-- WHERE clause (f1.rating = f2.rating) restricts the inner rows to only films matching the current
+-- outer film's rating, and AVG then returns a single value, the average rental rate for that one
+-- rating. No GROUP BY is needed because the WHERE filter has already reduced the rows to one rating's
+-- worth, so the aggregate treats that filtered subset as one implicit group and returns exactly one
+-- number. This contrasts with a scalar subquery (Question 1), which computes one global average once
+-- as a constant. Here the benchmark changes per outer row, which is what makes the subquery correlated.
+SELECT f1.title, f1.rental_rate, f1.rating
+    FROM film AS f1
+    WHERE f1.rental_rate > (
+        SELECT AVG(f2.rental_rate)
+        FROM film AS f2
+        WHERE f1.rating = f2.rating
+    );
+    
+-- The following code returns the first name and the last name of customers who
+-- have made at least one payment. This is accomplished through a subquery and 
+-- EXISTS clause. The EXISTS clause returns a true or false value based on whether the
+-- subquery after it returns any rows or not. The subquery selectively returns rows of data 
+-- in the payment table based on its match to a customer id in the customer table
+-- if customer id exists in both tables, data is present in the payment table, and 
+-- the WHERE EXISTS clause returns true, selecting the first and last name of
+-- that customer.
+SELECT c.first_name, c.last_name
+    FROM customer as c
+    WHERE EXISTS (
+        SELECT *
+        FROM payment as p
+        WHERE c.customer_id = p.customer_id);
+ 
+-- Q2: Return the first and last names of customers who live in a city in India.
+-- I split this into a subquery and a main query. The subquery answers one question on its own,
+-- which cities are in India, by joining city to country and returning those city_ids. The main
+-- query then joins customer to address so I can get each customer's city_id, and the IN check keeps
+-- only the customers whose city_id shows up in the India list. I had the subquery return city_id
+-- instead of address_id because being in India is really a property of the city, so that is the
+-- level the filter should live at. I used = 'India' instead of LIKE 'india' since I want an exact
+-- match, not a pattern, and LIKE with no wildcard is just a slower way of writing =. The capital I
+-- matters too so it matches the value stored in the table.
+SELECT c.first_name, c.last_name
+    FROM customer AS c
+    JOIN address AS a ON a.address_id = c.address_id
+    WHERE a.city_id IN (
+        SELECT ci.city_id
+        FROM city AS ci
+        JOIN country AS co ON co.country_id = ci.country_id
+        WHERE co.country = 'India'
+    );
 
 
+-- Q3: Return films whose rental rate is higher than the average rental rate for their own rating.
+-- This one needed a correlated subquery because the benchmark changes per film. A PG film gets
+-- compared to the PG average, an R film to the R average, and so on. The subquery references
+-- f1.rating from the outer query, so it can't run by itself, it re-runs for each film using that
+-- film's rating. The WHERE inside (f1.rating = f2.rating) narrows the inner rows down to just the
+-- films with the same rating, and then AVG gives me one number for that rating. I originally tried
+-- GROUP BY plus HAVING here, but that was wrong. Since I only want one aggregated value, I don't
+-- need GROUP BY. Filtering with WHERE first means the average only ever sees one rating's worth of
+-- films, so it returns a single value instead of computing all five and throwing four away.
+SELECT f1.title, f1.rental_rate, f1.rating
+    FROM film AS f1
+    WHERE f1.rental_rate > (
+        SELECT AVG(f2.rental_rate)
+        FROM film AS f2
+        WHERE f1.rating = f2.rating
+    );
 
+
+-- Q4: Return customers who have made at least one payment, using EXISTS.
+-- For each customer, the subquery looks in the payment table for a row matching that customer's id.
+-- EXISTS just checks whether any rows come back, true or false, it doesn't care what's in them.
+-- The moment it finds one match it stops and returns true, so the customer gets kept. That's why I
+-- can write SELECT * in there, EXISTS ignores what I select and only cares that rows exist.
+SELECT c.first_name, c.last_name
+    FROM customer AS c
+    WHERE EXISTS (
+        SELECT *
+        FROM payment AS p
+        WHERE c.customer_id = p.customer_id
+    );
+
+ 
+-- The following code returns the first and last names of customers who have made no payment. This is
+-- the reverse of the previous query and uses NOT EXISTS. For each customer, the subquery checks the
+-- payment table for a matching row, and NOT EXISTS keeps the customer only when the subquery returns
+-- nothing. This is an anti-join, the same idea as the films with no inventory query from Tier 3.
+-- Because every customer in Sakila has payments, this returns zero rows, which is the correct result
+-- rather than an error.
+-- Note on NOT IN versus NOT EXISTS: this same question could be written with NOT IN against a subquery
+-- of payment customer_ids, but NOT IN returns wrong results if that list contains a NULL. SQL cannot
+-- resolve "not equal to NULL" as true or false, so a single NULL causes NOT IN to return no rows at
+-- all. NOT EXISTS tests whether rows exist rather than comparing values, so a NULL cannot break it.
+-- For anti-joins where the tested column may contain NULLs, NOT EXISTS is the safer choice.
+SELECT c.first_name, c.last_name
+    FROM customer AS c
+    WHERE NOT EXISTS (
+        SELECT *
+        FROM payment AS p
+        WHERE c.customer_id = p.customer_id
+    );
+ 
 -- -------------------------------------------------------------
 -- TIER 5: CTEs
 -- Constructs: single CTE, chained CTEs, CTE vs subquery judgment
