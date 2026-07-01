@@ -272,7 +272,49 @@ ties (like title) would wrongly drop genuine pairs that happen to share that val
 ---
 
 ## Tier 4: Subqueries
-*(to be filled as queries are written)*
+A  subquery is a query nested inside another query.
+The inner query runs and hands its result to the outer query to use. Useful for questions that
+are naturally two-step: "customers who spent above average" = first compute the average, then
+find customers above it. Expressing both steps as one statement keeps it correct when data changes,
+instead of reading a number off the screen and pasting it into a second query by hand.
+
+Scalar subquery: returns ONE value, runs ONCE.
+WHERE rental_rate > (SELECT AVG(rental_rate) FROM film). The inner query computes a single value
+(one row, one column) a single time, and that value sits in the WHERE clause as a constant while the
+outer query scans every row against it. It runs once, not once per row, because its answer is a
+property of the whole table and does not change from row to row. This "runs once" behavior is the
+key contrast with correlated subqueries (which re-run per outer row).
+
+IN subquery: returns a LIST, tested for membership.
+Same IN keyword as Tier 1, but instead of a hand-typed list, a subquery generates it.
+WHERE a.city_id IN (SELECT ci.city_id FROM city ci JOIN country co ... WHERE co.country = 'India').
+The subquery should return the column at the level where the filter logic actually lives (city_id,
+because "being in India" is a property of a city), and answer one self-contained question.
+
+Where to "cut" a multi-table chain: a real design judgment.
+For a four-table chain (customer -> address -> city -> country), you can split the work between the
+outer query and the subquery at different points. One version keeps customer alone in the outer query
+and puts the other three tables in the subquery (returning address_id). Another joins customer+address
+in the outer query and puts city+country in the subquery (returning city_id). Same result, different
+cut point. The cleaner cut is the one where each piece expresses one clear idea: the subquery answers
+exactly "which cities are in India" (city + country only). No single right answer; it is a readability
+judgment. Recognizing this tradeoff is a fluency marker.
+
+LIKE without a wildcard is a disguised equality.
+LIKE 'india' with no % behaves like = 'india', so the LIKE signals unclear intent. Use = for an
+exact match. Also match the stored casing: = 'India', not 'india'. A lowercase value only works
+because MySQL's default collation is case-insensitive; under a case-sensitive collation it would
+silently return zero rows.
+
+A table can be joined purely as scaffolding, never displayed.
+Tables appear in a query for one of two reasons: to provide columns you want to SELECT, or to provide
+a PATH to a column you want to filter or join on. In the India query, the address table is joined only
+to reach city_id for the filter; not one of its columns is selected. This breaks the beginner
+assumption that every joined table must contribute a visible column. Connector/bridge tables earn
+their place by connecting things, not by showing data.
+- Junction tables are the clearest example: joining actor to film through film_actor never selects
+anything FROM film_actor. It exists purely to bridge the two tables you actually care about.
+Same principle as the address bridge, just for a many-to-many relationship.
 
 ---
 
