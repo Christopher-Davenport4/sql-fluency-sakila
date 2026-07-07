@@ -418,14 +418,112 @@ SELECT c.first_name, c.last_name
         WHERE c.customer_id = p.customer_id
     );
  
+ - The following code returns the customer_id and total amount paid for customers whose total payments
+-- exceed 150 dollars. The total is computed inside a derived table, which is a subquery placed in the
+-- FROM clause. The derived table groups the payment table by customer_id and uses SUM to compute each
+-- customer's total, and HAVING filters those groups down to totals above 150. The derived table must be
+-- given an alias (cust_payment) or MySQL will error. The outer query then selects from that result set
+-- as if it were an ordinary table. The filter is written with HAVING here because SUM is an aggregate,
+-- and an aggregate can only be filtered after grouping. An equivalent approach would leave the derived
+-- table unfiltered and instead filter in the outer query with WHERE tot_pay > 150, because once the
+-- derived table runs, tot_pay is no longer a live aggregate but a plain column value in a temporary
+-- table, so a normal WHERE applies to it.
+SELECT customer_id, tot_pay
+    FROM (
+        SELECT customer_id, SUM(amount) AS tot_pay
+        FROM payment
+        GROUP BY customer_id
+        HAVING SUM(amount) > 150
+    ) AS cust_payment;
+ 
+ 
+-- The following code outputs the average total spending among higher-end customers, meaning those who
+-- spent more than 150 dollars. This requires a derived table because it computes an average of sums,
+-- an aggregate of an aggregate, which cannot be done in a single grouped query. The inner query groups
+-- the payment table by customer_id and uses SUM to produce each customer's total, and HAVING keeps only
+-- the customers whose total exceeds 150. That result set becomes the derived table (aliased
+-- cust_payment), and the outer query runs AVG over those totals to return the average spend among that
+-- higher-end group. Here the outer query does real work that the inner query cannot do on its own, which
+-- is what makes the derived table necessary rather than redundant.
+SELECT AVG(tot_pay) AS average_pay
+    FROM (
+        SELECT SUM(amount) AS tot_pay
+        FROM payment
+        GROUP BY customer_id
+        HAVING SUM(amount) > 150
+    ) AS cust_payment;
+ 
 -- -------------------------------------------------------------
 -- TIER 5: CTEs
 -- Constructs: single CTE, chained CTEs, CTE vs subquery judgment
 -- -------------------------------------------------------------
 
 
-
-
+-- The following code returns the average total spending among higher-end customers (i.e., those who
+-- spent more than 150 dollars0. It is the same logic as the earlier derived table version, rewritten as
+-- a CTE. The WITH block defines a named result set (high_spender_totals) that groups the payment table
+-- by customer_id, sums each customer's payments, and uses HAVING to keep only totals above 150. The
+-- main query then selects from that named result set and takes AVG over the totals. A CTE and a derived
+-- table produce the identical result here. The difference is only structure. The CTE lifts the subquery
+-- out of the FROM clause, names it, and defines it up front, so the query reads top to bottom instead
+-- of inside out.
+WITH high_spender_totals AS (
+    SELECT SUM(amount) AS total_paid
+    FROM payment
+    GROUP BY customer_id
+    HAVING SUM(amount) > 150
+)
+SELECT AVG(total_paid) AS avg_high_spender_pay
+    FROM high_spender_totals;
+ 
+ 
+-- The following code returns the average number of films per category, counting only categories that
+-- have more than 50 films. The CTE (large_categories) joins category to the film_category junction
+-- table, groups by category name, counts the films in each category, and uses HAVING to keep only
+-- categories with more than 50 films. This produces a result set of one row per qualifying category
+-- with its film count. The main query then takes AVG over that film_count column with no GROUP BY,
+-- which collapses all the qualifying categories into a single number, the average count across them.
+-- No GROUP BY is used in the main query because the goal is one summary value across all categories,
+-- not one row per category.
+WITH large_categories AS (
+    SELECT c.name AS category_name, COUNT(fc.film_id) AS film_count
+    FROM category AS c
+    JOIN film_category AS fc ON c.category_id = fc.category_id
+    GROUP BY category_name
+    HAVING film_count > 50
+)
+SELECT AVG(film_count) AS avg_films_per_category
+    FROM large_categories;
+ 
+ 
+-- The following code returns the single category with the highest average rental rate among its films,
+-- along with that average. It uses two chained CTEs. The first CTE (category_films) joins category to
+-- the film_category junction table to pair each category name with its film_ids. The second CTE
+-- (category_avg_rates) reads from category_films, joins it to the film table on film_id to reach each
+-- film's rental rate, then groups by category name and averages the rental rates, producing one row per
+-- category with its average. The main query reads from category_avg_rates, orders the categories by
+-- average rental rate in descending order, and uses LIMIT 1 to keep only the top row. ORDER BY plus
+-- LIMIT 1 is the standard idiom for selecting the single highest of something, and it avoids the problem
+-- of pairing a MAX aggregate with a non-aggregated category name.
+-- Note: if two categories tied for the highest average, LIMIT 1 would arbitrarily return only one of
+-- them and hide the tie. A window function (RANK) would be needed to keep all tied rows.
+WITH category_films AS (
+    SELECT c.name AS category_name, fc.film_id
+    FROM category AS c
+    JOIN film_category AS fc ON c.category_id = fc.category_id
+),
+category_avg_rates AS (
+    SELECT category_films.category_name,
+           AVG(f.rental_rate) AS avg_rental_rate
+    FROM film AS f
+    JOIN category_films ON category_films.film_id = f.film_id
+    GROUP BY category_films.category_name
+)
+SELECT category_name, avg_rental_rate
+    FROM category_avg_rates
+    ORDER BY avg_rental_rate DESC
+    LIMIT 1;
+    
 -- -------------------------------------------------------------
 -- TIER 6: Window Functions
 -- Constructs: ROW_NUMBER, RANK, DENSE_RANK, PARTITION BY,
