@@ -1,534 +1,585 @@
-# Project 3: Learning Log
-
-This file captures patterns, gotchas, and conceptual distinctions as they surface.
-Updated continuously throughout the project. The goal is to turn repetition into
-retained understanding.
-
----
-
-## Tier 0: Schema Orientation
-
-**Junction tables resolve many-to-many relationships.**
-A junction table holds two foreign keys, one pointing to each side of the relationship.
-One row represents one link between two entities. Sakila has two: film_actor and film_category.
-
-**The geographic chain runs four tables deep.**
-customer -> address -> city -> country
-Joined on address_id, city_id, country_id respectively.
-This chain appears in any query that needs customer location and must be written in full each time.
-
-**Two foreign keys can point to the same table independently.**
-Both staff and store have their own address_id column, both pointing to the address table.
-When both are needed in the same query, the address table must be joined twice using aliases
-to distinguish which join is serving which purpose.
-
-**staff.store_id is a foreign key to store.**
-Each staff member belongs to exactly one store. The foreign key lives in staff, not store.
-
----
-
-## Environment Notes
-
-**Forward slashes required in MySQL client file paths on Windows.**
-The MySQL SOURCE command interprets backslashes as escape characters.
-Use forward slashes instead: SOURCE C:/path/to/file.sql;
-
-**PATH must point to MySQL Server bin, not MySQL Shell bin.**
-MySQL Shell (C:\Program Files\MySQL\MySQL Shell 8.0\bin) does not contain mysql.exe.
-The correct PATH entry is: C:\Program Files\MySQL\MySQL Server 8.0\bin
-
-**Load schema before data, always.**
-The data file assumes tables already exist. Running data first produces immediate errors.
-
----
-
-## Tier 1: Single-Table Fundamentals
-
-**LIKE is pattern matching, not equality.**
-`=` requires an exact match. `LIKE` matches against a pattern with wildcards.
-`WHERE last_name = 'S%'` looks for the literal two-character string "S%" and matches nothing.
-The two wildcards are `%` (any sequence of zero or more characters) and `_` (exactly one character).
-Wildcard placement controls anchoring: `'S%'` starts with S, `'%S'` ends with S, `'%S%'` contains S anywhere.
-To find a value anywhere inside a string, wrap it in `%` on both sides.
-
-**COUNT(*) counts rows; COUNT(column) counts non-NULL values.**
-`COUNT(*)` counts every row matching the WHERE condition, NULLs included.
-`COUNT(column)` counts only rows where that column is not NULL.
-The difference between the two equals the number of NULLs in that column. Useful data-quality check.
-
-**Cannot mix aggregated and non-aggregated columns without GROUP BY.**
-`SELECT title, COUNT(*) FROM film` throws an error under only_full_group_by.
-COUNT collapses many rows into one value, but title exists per row, so MySQL cannot reconcile them.
-This is the conceptual bridge into Tier 2 aggregation.
-
-**The datetime BETWEEN trap. (Most important gotcha of this tier.)**
-On a plain DATE column, BETWEEN is clean.
-On a DATETIME column, `BETWEEN '2005-07-01' AND '2005-08-01'` is buggy:
-the upper bound is read as midnight `'2005-08-01 00:00:00'`, and because BETWEEN is inclusive,
-a record stamped exactly at that midnight is wrongly included as July.
-Ending the range at the last day instead (`'2005-07-31'`) wrongly excludes everything after
-midnight on the 31st.
-The fix is a half-open range, correct by construction:
-  `WHERE d >= '2005-07-01' AND d < '2005-08-01'`
-`>=` includes the first instant, `<` excludes the first instant of the next period.
-Conciseness is not worth a correctness risk. Use the half-open pattern as the default for datetimes.
-
-**Terminology precision.**
-`>=` and `<` are comparison (relational) operators.
-`AND`, `OR`, `NOT` are Boolean operators.
-A single query often uses both: comparisons inside each condition, a Boolean to join them.
-
-**IN is preferable to chained OR.**
-`WHERE rental_rate IN (0.99, 2.99)` is more readable, scales cleanly, and is edited in one place.
-`NOT IN` excludes a list, but carries a NULL gotcha: if the column or list contains NULL,
-NOT IN can silently drop rows. Safe in Sakila's rating column (no NULLs), but prefer NOT EXISTS
-when NULLs are possible. Revisit in Tier 4.
-
-**IS NULL / IS NOT NULL, never = NULL.**
-NULL does not equal anything, so equality operators fail on it.
-Checking for NULLs is a standard first step before analysis.
-Finding zero NULLs (as with customer.email) is itself a meaningful data-quality finding.
-
-**Documentation discipline.**
-Describe what a query does mechanically, not a real-world label inferred from the result.
-"Films not rated G, PG, or PG-13" is correct; "adults-only films" is an interpretation that
-the query logic does not actually enforce.
-
----
-
-## Tier 2: Aggregation
-
-**GROUP BY is not an aggregation function.**
-GROUP BY is a clause that partitions rows into groups. The aggregate functions
-(COUNT, SUM, AVG, MIN, MAX) are separate and compute one value per group.
-Keeping these two ideas distinct is the key to the whole tier.
-
-**GROUP BY produces the same distinct values as DISTINCT, plus the ability to aggregate.**
-`SELECT rating FROM film GROUP BY rating` returns the same rows as
-`SELECT DISTINCT rating FROM film`. GROUP BY is the more powerful form because it
-lets you attach an aggregate to each group.
-
-**Aggregation can happen without GROUP BY.**
-If no GROUP BY is present, the aggregate treats the entire table as one single group
-and returns one summary row. `SELECT MIN(amount), MAX(amount), AVG(amount) FROM payment`
-collapses all rows into one. Aggregation is present; grouping is simply absent.
-
-**The SELECT rule: grouped or aggregated, nothing else.**
-Every column in the SELECT must either appear in the GROUP BY or be wrapped in an
-aggregate function. Reason: each output row is a collapsed group, and every value in
-that row must be unambiguous. A GROUP BY column is unambiguous because it holds one
-constant value within the group. An aggregate is unambiguous because it deliberately
-collapses many values into one. A bare non-grouped column is ambiguous (the group holds
-many values, SQL cannot pick one) and throws an error. This is the same error as the
-Tier 1 `SELECT title, COUNT(*)` failure.
-
-**WHERE vs HAVING. (The central concept of the tier.)**
-WHERE filters individual rows BEFORE grouping. HAVING filters groups AFTER aggregation.
-If a condition references an aggregate (COUNT, SUM, etc.), it must go in HAVING because
-the aggregate does not exist until after grouping. If a condition references a raw column
-value, it goes in WHERE, both because it must (the row-level value is what is being tested)
-and for efficiency (filtering rows early shrinks the data before the expensive grouping step).
-Interview phrasing: "WHERE filters rows before aggregation, HAVING filters groups after."
-
-**Multi-column GROUP BY groups by the combination.**
-`GROUP BY customer_id, staff_id` creates one group per unique PAIRING of the two columns,
-not one group per column separately. Produces more rows than grouping by either alone.
-
-**The common reporting pattern: aggregate then order by the aggregate.**
-`GROUP BY entity, SUM/COUNT the metric, ORDER BY that metric DESC` is the shape behind
-"top N customers by revenue," "top products by units sold," etc. Extremely common.
-
-**ROUND for formatting aggregates.**
-`ROUND(AVG(amount), 2)` nests the aggregate inside ROUND; the second argument is the
-number of decimal places. AVG often returns long decimals, so round for readability.
-
-**Aliasing discipline (recurring).**
-Prefer clean snake_case aliases (avg_rental_rate, film_count). Avoid quoted aliases with
-spaces or symbols ('Average Rental Rate') because they must be backtick-wrapped everywhere
-downstream. Avoid aliasing an aggregate with the same name as a grouped column (e.g. naming
-a count "rating" when grouping by rating) because it shadows the column and causes ambiguity
-in ORDER BY and subqueries. Display-friendly capitalization belongs in the BI tool, not the query.
-
-**Documentation discipline (recurring).**
-A SELECT returns a RESULT SET, not a table. A table is a persistent stored object created
-with CREATE TABLE. Reserve the word "table" for actual stored tables. This distinction matters
-before Tier 4 (derived tables, CTEs) and views.
-
----
-
-## Tier 3: Joins
-
-**The core mental model.**
-Every join combines rows from two tables based on a relationship, almost always a foreign
-key matching a primary key. The ON clause states that relationship. The join condition is
-where you declare how the two tables connect.
-
-**INNER JOIN is about matches, not NULLs.**
-INNER JOIN returns a row only when a row in one table has a matching row in the other on the
-join condition. Unmatched rows are DROPPED from both sides. This is the defining feature.
-Do NOT think of INNER JOIN as a NULL check; think of it as "keep only the rows that find a
-match." (NULLs become relevant in LEFT/RIGHT JOIN, where unmatched rows are kept and the
-missing side is filled with NULL.)
-
-**JOIN defaults to INNER JOIN.**
-Writing `JOIN` alone is identical to `INNER JOIN` in MySQL. Writing INNER explicitly is
-clearer for readers but not required.
-
-**Always alias tables and qualify every column in a join.**
-Use short aliases (`FROM staff AS s`) and qualify every column (`s.first_name`), even
-unambiguous ones. Two reasons: readability (the reader instantly sees each column's source),
-and safety (a column that is unique today may later be added to the other table, breaking an
-unqualified query with an ambiguity error). A column that exists in BOTH tables (like staff_id)
-MUST be qualified or MySQL throws an "ambiguous column" error.
-
-**Predict the row count as a sanity check.**
-In a one-to-many relationship, an INNER JOIN yields one row per row on the "many" side,
-provided each many-side row has a match. Example: staff (2 rows) joined to payment (16044 rows)
-on staff_id returns 16044 rows, one per payment, with staff fields repeating. Before trusting
-any join, predict its row count from the relationship. A result far larger than expected usually
-signals an unintended many-to-many fan-out, one of the most common join bugs.
-
-**Watch the Workbench 1000-row display cap.**
-The Workbench result grid caps its display (often at 1000 rows) and shows "1000 row(s)" even
-when the true result is larger. To get the real count, wrap the query in SELECT COUNT(*).
-
-**The multi-hop chain (the gap-closing pattern).**
-To reach a table with no direct relationship, chain joins hop by hop. The geographic chain:
-  customer -> address (on address_id) -> city (on city_id) -> country (on country_id)
-Each new JOIN connects back to a table already in the query via its alias. This four-table
-chain is the backbone of any "by city" or "by country" analysis of customers. Extendable one
-hop at a time.
-
-**The junction-table bridge (many-to-many).**
-To join two tables in a many-to-many relationship, route through the junction table that holds
-both foreign keys. Example, films an actor appeared in:
-  actor -> film_actor (on actor_id) -> film (on film_id)
-One row in the junction table is one pairing, so the join yields one output row per pairing.
-
-**Junction tables use a composite primary key.**
-A junction table's primary key is the COMBINATION of its two foreign keys (e.g. actor_id +
-film_id together), not either alone. This makes each PAIRING unique: an actor_id can repeat
-across films and a film_id can repeat across actors, but the specific pair appears exactly once.
-This composite key is what makes the many-to-many relationship work without duplicate pairings.
-
-**Logical processing order (why WHERE is not "run last").**
-SQL processes joins first (assembling combined rows), then WHERE (filtering those rows), then
-SELECT (choosing columns), then ORDER BY. WHERE sits near the end of the WRITTEN query by
-convention, but it filters the joined rows before the output is selected and ordered; it does
-not literally execute last. ORDER BY and column selection happen after WHERE.
-
-**Documentation discipline (recurring).**
-A SELECT returns a RESULT SET, not a table. Stop writing "creates a table" for a SELECT.
-
-**LEFT JOIN keeps every left-table row; unmatched right columns become NULL.**
-LEFT JOIN preserves every row from the left (FROM) table. If a left row has a match on the
-right, the right columns fill in normally. If it has no match, the left row is KEPT anyway and
-every right-table column comes back NULL. Those NULLs are meaningful: they mark left rows that
-found no match. This is where NULLs legitimately enter a join result.
-
-**The anti-join pattern.**
-LEFT JOIN the table you want everything from, then filter WHERE the right side IS NULL. This
-isolates exactly the left rows with NO match on the right. Uses: "films with no inventory,"
-"customers who never rented," "products never sold." Same shape every time.
-
-**Test the right table's PRIMARY KEY for the IS NULL filter.**
-In an anti-join, filter the NULL check on the right table's primary key (or any guaranteed
-non-NULL column), never a nullable column. Reason: a primary key is never NULL in a real row,
-so a NULL there can ONLY mean "no match." A nullable column's NULL is ambiguous: it could mean
-"no match" OR "matched but that column was empty," which would corrupt the filter.
-
-**Three questions, two tables, distinguished by join type:**
-- INNER JOIN -> rows that HAVE a match ("films that have inventory")
-- LEFT JOIN + WHERE right IS NULL -> rows with NO match ("films with no inventory")
-- LEFT JOIN, no NULL filter -> ALL left rows, with match data where it exists
-
-**RIGHT JOIN is the mirror of LEFT; rarely used in practice.**
-RIGHT JOIN preserves every row from the table in the JOIN clause (the right table). Any RIGHT
-JOIN can be rewritten as a LEFT JOIN by swapping table order. Analysts default to LEFT JOIN
-because it keeps the anchor table (the table the question is about) in the natural first
-position, reading top to bottom. Interview-ready phrasing: "I default to LEFT JOIN because any
-RIGHT JOIN can be rewritten as a LEFT by swapping table order, and leading with the anchor reads
-more naturally." A SELECT can pull columns from ANY table in the query regardless of whether it
-is in FROM or JOIN; table position does not restrict column access.
-
-**Join sides generalize as joins stack.**
-For two tables: FROM is the left table, JOIN is the right table. For three or more, each new
-JOIN attaches to the accumulated result of everything above it, so "left" = everything joined so
-far, "right" = the table in the current JOIN clause.
-
-**Self-join: a table joined to itself.**
-Used when rows in one table relate to OTHER rows in the same table (hierarchies, or comparing
-rows to each other). The table is named twice with TWO DIFFERENT ALIASES (e.g. f1, f2) so SQL
-can treat the copies as distinct. The ON clause connects them on the relating columns.
-
-**The self-join deduplication trick: < on the primary key.**
-Naively self-joining on a shared value produces two problems: self-pairings (a row matched with
-itself) and duplicate pairs (A/B and B/A). Adding `f1.pk < f2.pk` fixes BOTH at once, because <
-is directional: equal ids fail the test (drops self-pairings), and only one ordering of each
-genuine pair satisfies < (drops the flipped duplicate). Always compare on the PRIMARY KEY, not a
-descriptive column, because the pk is guaranteed unique; comparing on a column that could have
-ties (like title) would wrongly drop genuine pairs that happen to share that value.
-
----
-
-## Tier 4: Subqueries
-
-**A subquery is a query nested inside another query.**
-The inner query runs and hands its result to the outer query to use. Useful for questions that
-are naturally two-step: "customers who spent above average" = first compute the average, then
-find customers above it. Expressing both steps as one statement keeps it correct when data changes,
-instead of reading a number off the screen and pasting it into a second query by hand.
-
-**Scalar subquery: returns ONE value, runs ONCE.**
-`WHERE rental_rate > (SELECT AVG(rental_rate) FROM film)`. The inner query computes a single value
-(one row, one column) a single time, and that value sits in the WHERE clause as a constant while the
-outer query scans every row against it. It runs once, not once per row, because its answer is a
-property of the whole table and does not change from row to row. This "runs once" behavior is the
-key contrast with correlated subqueries (which re-run per outer row).
-
-**IN subquery: returns a LIST, tested for membership.**
-Same IN keyword as Tier 1, but instead of a hand-typed list, a subquery generates it.
-`WHERE a.city_id IN (SELECT ci.city_id FROM city ci JOIN country co ... WHERE co.country = 'India')`.
-The subquery should return the column at the level where the filter logic actually lives (city_id,
-because "being in India" is a property of a city), and answer one self-contained question.
-
-**Where to "cut" a multi-table chain: a real design judgment.**
-For a four-table chain (customer -> address -> city -> country), you can split the work between the
-outer query and the subquery at different points. One version keeps customer alone in the outer query
-and puts the other three tables in the subquery (returning address_id). Another joins customer+address
-in the outer query and puts city+country in the subquery (returning city_id). Same result, different
-cut point. The cleaner cut is the one where each piece expresses one clear idea: the subquery answers
-exactly "which cities are in India" (city + country only). No single right answer; it is a readability
-judgment. Recognizing this tradeoff is a fluency marker.
-
-**LIKE without a wildcard is a disguised equality.**
-`LIKE 'india'` with no % behaves like `= 'india'`, so the LIKE signals unclear intent. Use `=` for an
-exact match. Also match the stored casing: `= 'India'`, not `'india'`. A lowercase value only works
-because MySQL's default collation is case-insensitive; under a case-sensitive collation it would
-silently return zero rows.
-
-**A table can be joined purely as scaffolding, never displayed.**
-Tables appear in a query for one of two reasons: to provide columns you want to SELECT, or to provide
-a PATH to a column you want to filter or join on. In the India query, the address table is joined only
-to reach city_id for the filter; not one of its columns is selected. This breaks the beginner
-assumption that every joined table must contribute a visible column. Connector/bridge tables earn
-their place by connecting things, not by showing data.
-    - Junction tables are the clearest example: joining actor to film through film_actor never selects
-      anything FROM film_actor. It exists purely to bridge the two tables you actually care about.
-      Same principle as the address bridge, just for a many-to-many relationship.
-
-**EXISTS / NOT EXISTS test row PRESENCE, not values.**
-EXISTS asks one thing: did the subquery return any rows, yes or no. It stops at the first match and
-does not care what the rows contain, so SELECT * or SELECT 1 inside behaves identically. EXISTS keeps
-the outer row when a match is found; NOT EXISTS keeps it when no match is found. The subquery in an
-EXISTS is a FILTER, not a data SOURCE: its contents (including any NULLs) are never returned to the
-outer query. Only the true/false verdict crosses the boundary. The outer row's displayed columns come
-from the outer table directly, never from the subquery.
-
-**NOT EXISTS as an anti-join.**
-NOT EXISTS finds "rows with no match," the same idea as the LEFT JOIN + IS NULL anti-join from Tier 3.
-For "customers who made no payment," the subquery looks for a matching payment and NOT EXISTS keeps
-the customer only when none is found. In Sakila every customer has payments, so this correctly returns
-zero rows (a valid answer, not a broken query).
-
-**NOT IN vs NOT EXISTS, and three-valued logic. (The key gotcha of the tier.)**
-SQL uses THREE truth values: true, false, and UNKNOWN. Any comparison against NULL returns UNKNOWN,
-because NULL means "unknown value" (a sealed box). You cannot confirm a known value equals it, and you
-also cannot confirm it is NOT equal to it, so both `= NULL` and `<> NULL` return UNKNOWN.
-    - NOT IN expands to a chain of <> joined by AND: `5 NOT IN (1, 2, NULL)` becomes
-      `5<>1 AND 5<>2 AND 5<>NULL`. The last term is UNKNOWN, and `true AND UNKNOWN` = UNKNOWN. A row is
-      only returned when WHERE is TRUE, and UNKNOWN is not true, so the row is dropped. A single NULL in
-      the list therefore makes NOT IN return NO rows at all, silently.
-    - NOT EXISTS is safe because it tests row presence, not value equality. No comparison against NULL
-      ever happens on the outer side, so nothing gets poisoned. A NULL inside the subquery just fails
-      the join condition like any other non-match.
-    - Rule: for an anti-join where the tested column could contain NULLs, use NOT EXISTS. NOT IN is only
-      safe when the subquery column is guaranteed non-NULL.
-    - The one-liner: NOT IN is a COMPARISON operator; EXISTS/NOT EXISTS is a PRESENCE operator.
-
-**Finding NULLs: use IS NULL / IS NOT NULL, never = NULL.**
-Because `column = NULL` returns UNKNOWN for every row (and finds nothing), NULLs need a dedicated
-presence test. IS NULL asks "is there a sealed box here," a yes/no that returns true or false and never
-gets stuck. This is why SQL had to invent a separate operator. In messy real-world data, "missing" can
-also be an empty string '' or whitespace, which are real known values that slip past IS NULL, so you
-sometimes check `WHERE col IS NULL OR col = ''`. The `= ''` works because an empty string is a known
-value, not the sealed box; only NULL forces the special IS NULL treatment.
-
-**Derived table: a subquery in the FROM clause.**
-Every other subquery so far lived in WHERE. A derived table sits in FROM, and its result set is treated
-like a temporary table the outer query can select from, filter, and join to. It MUST have an alias or
-MySQL errors. Use it when you need to aggregate first and then work with the aggregated results.
-    - Key insight: once the derived table runs, an aggregate like SUM(amount) AS tot_pay becomes a PLAIN
-      COLUMN of the temporary table, with no memory it was ever an aggregate. So the outer query can
-      filter it with an ordinary `WHERE tot_pay > 150`, even though `WHERE SUM(amount) > 150` is illegal
-      inside (WHERE runs before grouping, so the aggregate does not exist yet).
-    - This gives a THIRD way to filter on an aggregate: HAVING inside, OR push the aggregate into a
-      derived table and filter with WHERE outside. Same result, two routes; pick whichever reads cleaner.
-    - Derived tables are the bridge into Tier 5 CTEs (a CTE is a named, more readable derived table).
-
----
-
-## Tier 5: CTEs
-
-**A CTE is a named temporary result set defined up front with WITH.**
-`WITH name AS ( subquery ) SELECT ... FROM name`. The CTE runs first and hands its result to the main
-query, which is why the main query can reference the name as if it were a real table. Once defined, a
-CTE behaves like a table anywhere a table name could go: FROM, JOIN, subqueries.
-
-**A CTE is a derived table, pulled out of FROM and named.**
-Same result, same work, different structure. A derived table nests the subquery inside FROM so you
-read inside-out. A CTE lifts it out and names it, so the query reads top-to-bottom. For one small
-step the two are interchangeable and it is a style call.
-
-**Where CTEs actually beat derived tables:**
-- Multi-step logic becomes separate named blocks instead of subqueries nested three deep.
-- A CTE can be referenced MORE THAN ONCE in the main query. A derived table exists only at its one
-  spot in FROM.
-
-**Chained CTEs: the second reads FROM the first.**
-`WITH a AS (...), b AS (...)` with one WITH at the top, CTEs separated by commas, and the last one
-before the main query omitting the comma. Each CTE can only reference CTEs defined before it.
-Conceptually the same as the `%>%` pipe in R: sequential steps, each building on the last.
-
-**Build chained CTEs by working backwards.**
-Figure out what the final result needs to look like, then what feeds it, then what feeds that. Each
-layer becomes a CTE. This decomposition is the actual skill; the syntax is trivial once the steps are
-clear.
-
-**A wrapping layer (CTE or derived table) must earn its place.**
-It is REDUNDANT when the outer query just re-selects the inner results unchanged. If running the inner
-query alone gives the same answer, drop the wrapper and write the simpler query.
-It is NECESSARY when the outer query transforms, aggregates, joins, or ranks the inner result.
-Classic necessary case: AVG of SUM. `AVG(SUM(amount))` is illegal in one grouped query, so SUM inside
-and AVG outside.
-
-**Selecting the single top row: ORDER BY ... DESC LIMIT 1.**
-This is the standard idiom for "the highest" of anything. It avoids the trap of pairing a MAX aggregate
-with a non-aggregated column, because it sorts and takes the top rather than aggregating.
-Blind spot: if two rows tie for the top, LIMIT 1 arbitrarily returns one and silently hides the tie. To
-keep ties, use a window function (RANK). See Tier 6.
-
-**The grouping-vs-summarizing mistake. (Cost me real time.)**
-"Average number of films per category" wants ONE number. Leaving `GROUP BY category_name` in the main
-query returns one row per category instead, and the AVG does nothing because averaging a single value
-returns that same value. The diagnostic: if AVG of a group returns the group's own number back
-unchanged, the GROUP BY is defeating the aggregate. Drop it and let the aggregate collapse the whole
-set.
-
-**COUNT depends on "rows of what?"**
-Counting from a lookup table alone (e.g. `SELECT COUNT(name) FROM category GROUP BY name`) returns 1
-per entity, because that table has one row per entity. The join to the junction/detail table is what
-expands one category row into one row per film, which gives COUNT something real to count.
-Diagnostic: if every count is 1 and a `HAVING > 50` wipes the result to empty (so AVG returns NULL),
-you counted the lookup table instead of the detail rows.
-`COUNT(fc.film_id)` is more honest than `COUNT(c.name)` after the join, since it says "I am counting
-films."
-
-**Naming for readability.**
-The test: read ONLY the main query. If you can tell what it does from the names alone, without
-scrolling up to decode a CTE, the naming is good.
-- Name CTEs for their contents, not their position. `category_avg_rates`, not `t1`/`t2`/`temp`/`beans`.
-  A CTE is a noun; name it like the result set it holds.
-- Keep column aliases consistent. One name for one concept across the whole query, not `cat_name` in
-  one CTE and `categories` in the next for the same thing.
-- Match singular/plural to what the column holds. `avg_rental_rate` is one value per row, so singular.
-- Short table aliases are fine for base tables (`c`, `fc`, `f`). Save descriptive naming for CTEs.
-- snake_case, no spaces or capitals, or the alias needs backticks everywhere downstream.
-- Descriptive does not mean long. Two or three words. `category_avg_rates` is good;
-  `the_average_rental_rate_for_each_category` is worse than `t2`.
-
----
-
-## Tier 6: Window Functions
-
-**The core distinction: GROUP BY reduces rows, window functions preserve them.**
-An aggregate with GROUP BY collapses many rows into one per group. A window function performs the
-same calculation without collapsing anything: every original row survives and the computed value is
-attached as a new column on each row. `AVG(rental_rate) OVER (PARTITION BY rating)` returns all 1000
-films, each stamped with its own rating's average.
-
-**Terminology precision.**
-`AVG()` is the function (an ordinary aggregate). `OVER()` is a CLAUSE that turns it into a window
-function. `PARTITION BY` is a component INSIDE the OVER clause that defines which rows each
-calculation looks at. Neither OVER nor PARTITION BY is itself a function. The window function is the
-whole expression: `AVG(x) OVER (...)`.
-
-**PARTITION BY is the window-function cousin of GROUP BY.**
-It scopes the calculation to a group the same way GROUP BY does, but preserves the rows. Every row in
-the same partition receives the same value for an aggregate window function. That repetition across
-rows is the visible signature of a window function.
-
-**The three ranking functions differ only in how they handle ties.**
-- `ROW_NUMBER()` assigns a unique sequential number (1, 2, 3, 4), ignoring ties. Which tied row gets
-  the lower number is NON-DETERMINISTIC unless a tiebreaker is added to the ORDER BY inside OVER.
-- `RANK()` gives tied rows the same value, then skips ahead. Three rows tied at the top all get 1 and
-  the next row gets 4. The gaps reflect how many rows were tied above.
-- `DENSE_RANK()` gives tied rows the same value with no gaps. Three tied at the top all get 1 and the
-  next row gets 2. Its numbers count distinct values rather than rows.
-
-**Never rely on incidental ordering.**
-If tied rows happen to come back alphabetical, that is an artifact of physical row order or which
-index the engine scanned, not a rule. Add an explicit tiebreaker (`ORDER BY rate DESC, title`) so the
-ordering is deterministic and documented.
-
-**"Top 3" is ambiguous until tie handling is decided.**
-`DENSE_RANK() <= 3` returns the top three distinct VALUES (row count varies with repetition in the
-data). `RANK() <= 3` returns every row occupying the top three positions. `ROW_NUMBER() <= 3` returns
-exactly three rows, arbitrarily breaking ties. In Sakila, rental_rate has only three distinct values,
-so "top 3 most expensive films per rating" is not a meaningful question: DENSE_RANK returns all 1000
-films, RANK returns 336, and ROW_NUMBER returns an arbitrary 15. The right move is to go back to the
-stakeholder rather than hand them an arbitrary list labeled "top performers."
-
-**LAG and LEAD reach out to neighboring rows.**
-Unlike other window functions, these do not compute over a set; they grab a value from a specific
-other row in the partition. `LAG(col)` pulls from the previous row, `LEAD(col)` from the next. The
-ORDER BY inside OVER is what defines "previous" and "next," so it is required, not optional. The
-first row of a partition has no previous row, so LAG returns NULL there.
-
-**The NULL-vs-zero-default judgment. (A real data integrity point.)**
-`LAG(col, 1, 0)` substitutes 0 when no previous row exists. Only use a 0 default when zero is a real
-MEASUREMENT, not a placeholder for unknown. A running count of prior events genuinely starts at zero.
-A previous payment amount does not: defaulting to 0 asserts the previous payment WAS zero dollars
-rather than that none exists. Leaving it NULL is truthful, and NULL propagates through arithmetic, so
-`amount - LAG(amount)` correctly returns NULL on the first row instead of fabricating a change from
-nothing. Encoding missingness as a number (0, 99, -1) silently corrupts any average or sum over that
-column. This is a classic data-cleaning trap.
-
-**ORDER BY inside OVER is what makes SUM accumulate.**
-`SUM(x) OVER (PARTITION BY g)` returns the partition's grand total, stamped identically on every row.
-`SUM(x) OVER (PARTITION BY g ORDER BY d)` returns a RUNNING total. Adding the ORDER BY implicitly
-frames the window as "from the start of the partition through the current row." Same function, same
-partition, entirely different result.
-
-**Named windows remove duplication.**
-`SELECT LAG(x) OVER w, SUM(x) OVER w FROM t WINDOW w AS (PARTITION BY g ORDER BY d)`. The WINDOW
-clause defines the window once and names it. It goes after WHERE and before ORDER BY. MySQL 8.0
-supports this.
-
-**You CANNOT filter a window function in WHERE. (The tier's central mechanical lesson.)**
-Window functions are evaluated in the SELECT step, which runs AFTER WHERE. So the column does not
-exist yet when WHERE runs. `WHERE film_rank <= 3` throws "unknown column." HAVING fails for the same
-reason (it also runs before SELECT). This follows directly from the logical processing order:
-FROM, WHERE, GROUP BY, HAVING, SELECT, ORDER BY.
-
-**The fix, and the top-N-per-group pattern.**
-Compute the window function inside a CTE or derived table, which materializes it as a plain column of
-that result set. Then the outer query filters it with an ordinary WHERE. This is the same insight as
-aggregates in derived tables: once inside, it stops being a live window function and becomes a normal
-column. Rank inside the CTE, `WHERE rank <= N` outside. This single fact explains most window function
-errors people hit in practice.
-
----
-
-## Tier 7: Conditional Logic
-*(to be filled as queries are written)*
-
----
-
-## Tier 8: Set Operations
-*(to be filled as queries are written)*
-
----
-
-## Tier 9: Synthesis
-*(to be filled as queries are written)*
+USE sakila;
+
+
+-- =============================================================
+-- PROJECT 3: SQL FLUENCY DRILLING
+-- Dataset: Sakila (MySQL sample database)
+-- Author: Christopher Davenport
+-- =============================================================
+-- Convention: SQL keywords in UPPERCASE, table/column names in lowercase
+-- Each query is preceded by a comment stating the question it answers
+-- and any notes about the approach or construct being practiced.
+-- =============================================================
+
+
+
+-- -------------------------------------------------------------
+-- TIER 0: Schema Orientation
+-- No queries. Key relationships established by reading the EER
+-- diagram in MySQL Workbench before any analytical querying.
+--
+-- Key relationships confirmed:
+--   Geographic chain:
+--     customer -> address (address_id)
+--              -> city    (city_id)
+--              -> country (country_id)
+--
+--   Junction tables (many-to-many):
+--     film_actor    : film_id + actor_id
+--     film_category : film_id + category_id
+--
+--   Staff and store:
+--     staff holds store_id as a FK pointing to store
+--     Each staff member belongs to exactly one store
+--     Both staff and store have independent address_id FK to address
+-- -------------------------------------------------------------
+
+
+-- -------------------------------------------------------------
+-- TIER 1: Single-Table Fundamentals
+-- Constructs: WHERE, ORDER BY, DISTINCT, LIKE, IN, BETWEEN,
+--             date filtering
+-- -------------------------------------------------------------
+
+-- The following code selects customer information (first_name, last_name, email) from the customer.
+-- Only the customers whose last name starts with 'S' will be selected. This is accomplished through the pattern matching operator 
+-- LIKE, which will match the data within a column to the provided string match. % is used as a wildcard where any amount of characters
+-- may come after the S. Finally, this information is sorted in alphabetical order via last name 
+SELECT first_name, last_name, email 
+	FROM customer
+	WHERE last_name LIKE 'S%'
+    ORDER BY last_name;
+
+-- The following code selects the unique ratings that are used in the film table. In order to do this, DISTINCT is utilized. DISTINCT selects
+-- values from the specified column only once. This allows you to see every type of value represented within a column one time.
+SELECT DISTINCT rating
+	FROM film;
+
+-- The following code selects the titles of movies and the amount of time to rent (in days) from the film table where the movies are rented 
+-- between five and seven days. This list is first ordered by the duration and then alphabetized within each rental duration
+SELECT title, rental_duration
+	FROM film
+    WHERE rental_duration BETWEEN 5 AND 7
+    ORDER BY rental_duration, title;
+
+-- The following code returns title and description of films mentioning "astronaut" anywhere in the description
+-- this is done by putting % on both sides, which tells the query and amount of characters 
+-- may come before or after the word
+SELECT title, `description`
+	FROM film
+	WHERE `description` LIKE '%astronaut%';
+
+-- The following code returns the a number counting the amount of entries where movies have astronaut in their
+-- description. I tried to incorporate this in the previous syntax intially, but I received an error message.
+-- This is because count is an aggregate function, and I was passing two nonaggregated values with it, and 
+-- sql does not know how to handle this.
+SELECT count(*) AS with_astronaut
+	FROM film
+	WHERE `description` LIKE '%astronaut%';
+
+-- The following code is used to retrieve customer rental information for the month of July.
+-- Comparison operators were used in place of the BETWEEN clause to fix the common issue where
+-- dates outside of the anticipated range are included into the query. Using BETWEEN with a
+-- datetime datatype creates the range using inclusive logic on midnight, such that data collected
+-- up until midnight of the queried date will be included. In the example below, ending the range
+-- at August 1st with BETWEEN would have wrongly included rental data timestamped at midnight on
+-- August 1st. Conversely, ending at July 31st would have wrongly excluded all rental data
+-- recorded after midnight on that date. The half-open range, using >= on the start and < on the
+-- following month, avoids both boundary errors by construction.
+SELECT rental_id, rental_date, customer_id
+    FROM rental
+    WHERE rental_date >= '2005-07-01'
+      AND rental_date < '2005-08-01';
+
+-- The following list selects films whose rating is not G, PG, or PG-13, using NOT IN to exclude that list of values.
+-- The IN operator is used to compare values within a column to a (in this context) provided list.
+-- The LIKE operator is not applicable here as that is reserved for partial string comparisons
+SELECT title, rating 
+	FROM film
+    WHERE rating NOT IN ('G', 'PG', 'PG-13');
+
+-- -------------------------------------------------------------
+-- TIER 2: Aggregation
+-- Constructs: GROUP BY, COUNT, SUM, AVG, WHERE vs HAVING
+-- -------------------------------------------------------------
+
+-- The following code returns each value in the rating column, followed by the count for
+-- each time the rating occurs. GROUP BY performs a similar function to SELECT DISTINCT
+-- as it will only output the values once for the specified column. The major difference
+-- is that GROUP BY allows you to perform aggregations functions to assess the contents
+-- of the unique values.
+SELECT rating, COUNT(*) AS '# of movies'
+	FROM film
+    GROUP BY rating;
+
+
+-- The following code utilizes the GROUP BY clause to find the average rental rate for each
+-- rating value. The averaged rate is rounded to the nearest hundredth using the ROUND() function,
+-- where the second argument (2) specifies the number of decimal places retained.
+SELECT rating, ROUND(AVG(rental_rate), 2) AS avg_rental_rate
+    FROM film
+    GROUP BY rating;
+    
+-- The following code displays only the rating values that have more than 200 movies with that value.
+-- This is accomplished by selecting the rating column, computing a count of films per group with
+-- COUNT(*), grouping by rating, and then using HAVING to include only the ratings whose computed
+-- count is greater than 200. HAVING is required here rather than WHERE because the count is an
+-- aggregate that does not exist until after the rows are grouped.
+SELECT rating, COUNT(*) AS number_of_films
+    FROM film
+    GROUP BY rating
+    HAVING number_of_films > 200;
+
+-- The following code returns each rating and the number of films with that rating, restricted to
+-- films whose rental rate is 4.99, and further restricted to ratings represented by more than 200
+-- such films. Two filters operate at two different stages. The WHERE clause filters individual
+-- rows before grouping, removing every film that is not priced at 4.99. Because rental_rate is a
+-- raw row-level value, it must be filtered here, before aggregation occurs. The GROUP BY clause
+-- then collapses the surviving rows into one group per rating, and COUNT(*) computes the size of
+-- each group. The HAVING clause filters those groups after aggregation, keeping only ratings whose
+-- count exceeds 200. Because that count is an aggregate that does not exist until after grouping,
+-- it cannot be filtered in WHERE and must be placed in HAVING. The general rule: row-level
+-- conditions belong in WHERE, aggregate conditions belong in HAVING.
+SELECT rating, COUNT(*) AS number_of_films
+    FROM film
+    WHERE rental_rate = 4.99
+    GROUP BY rating
+    HAVING number_of_films > 200;
+    
+-- The following code creates a set of customer ids, the amount they spent, and orders 
+-- these data in descending order (most to least)
+SELECT customer_id, SUM(amount) as total_spent
+	FROM payment
+    GROUP BY customer_id
+	ORDER BY total_spent DESC;
+	
+-- The following code returns the lowest amount spent, the highest amount spent, and 
+-- the average amount spend. Since we are query across all customers and returning
+-- one value, group by is not needed. instead, these data are treating as a singular
+-- group, and it is aggregated within that group
+SELECT MIN(amount), MAX(amount), AVG(amount)
+	FROM payment;
+
+-- The following code returns the number of payments for each unique pairing of customer and staff
+-- member. Listing two columns in the GROUP BY clause groups the rows by the combination of those
+-- columns, producing one group per distinct (customer_id, staff_id) pairing rather than one group
+-- per column individually. COUNT then counts the payments within each pairing. Both customer_id and
+-- staff_id appear in the GROUP BY because every non-aggregated column in the SELECT must be grouped
+-- or aggregated. Within each group those columns hold a single constant value, so they can sit
+-- unambiguously beside the aggregated count.
+SELECT customer_id, staff_id, COUNT(amount) AS num_payments
+    FROM payment
+    GROUP BY customer_id, staff_id;
+ 
+-- -------------------------------------------------------------
+-- TIER 3: Joins
+-- Constructs: INNER JOIN, LEFT JOIN, RIGHT JOIN,
+--             multi-hop geographic chain, junction table joins,
+--             self-joins, aliasing when two FKs hit the same table
+-- -------------------------------------------------------------
+
+-- The following code joins the first and last name from the staff table with the amount and payment id
+-- from the payment table. This is done with an INNER JOIN on staff_id, the column shared by both tables.
+-- Because INNER JOIN was used, the output only contains payments that have a matching staff record.
+-- Any row without a match on staff_id is excluded. The result has 16044 rows, one per payment, since
+-- each payment matches exactly one staff member while each staff member matches many payments.
+SELECT s.first_name, s.last_name, p.amount, p.payment_id
+    FROM staff AS s
+    INNER JOIN payment AS p
+    ON s.staff_id = p.staff_id;
+    
+-- The following code combines the first and last name columns from the customer table with the city
+-- column of the city table. Given that there is not a direct link between customer and city, two joins
+-- were used: 1) customer with address and 2) address with city.
+SELECT c.first_name, c.last_name, ci.city
+	FROM customer as c
+    JOIN address as a
+    ON c.address_id = a.address_id
+    JOIN city as ci
+    ON ci.city_id = a.city_id;
+
+-- The following code returns the first and last name from the actor table and the title from the film
+-- table, but only for the actor named Nick Wahlberg. Actor and film have no direct relationship, so they
+-- are linked through the film_actor junction table. Actor joins to film_actor on actor_id, then
+-- film_actor joins to film on film_id.
+-- NOTE: the joins assemble the combined rows first, then WHERE filters those joined rows, and finally
+-- the SELECT columns are chosen and ORDER BY is applied. WHERE appears near the end of the written query
+-- by convention, but it does not literally run last.
+SELECT a.first_name, a.last_name, f.title
+    FROM actor AS a
+    JOIN film_actor AS fa
+    ON fa.actor_id = a.actor_id
+    JOIN film AS f
+    ON f.film_id = fa.film_id
+    WHERE a.first_name = 'Nick' AND a.last_name = 'Wahlberg'
+    ORDER BY f.title;
+
+-- The following code returns the titles from the film table where there is no linking entry in the
+-- inventory table, meaning films with no physical copies. A LEFT JOIN returns all titles from the film
+-- table regardless of whether a matching inventory row exists, and films with no match get NULL in every
+-- inventory column. The WHERE clause then filters on inventory_id IS NULL to keep only those unmatched
+-- films. This is the anti-join pattern. The primary key is tested for NULL because a primary key is never
+-- NULL in a real row, so a NULL there can only mean no match.
+SELECT f.title
+	FROM film as f
+    LEFT JOIN inventory as i
+    ON f.film_id = i.film_id
+    WHERE i.inventory_id IS NULL;
+
+-- The following code is the RIGHT JOIN version of the previous anti-join. RIGHT JOIN preserves every row
+-- from the table in the JOIN clause, so film is placed there and inventory moves to FROM. The ON condition
+-- and the IS NULL filter are unchanged, and the result is identical at 42 films. A RIGHT JOIN and a LEFT
+-- JOIN can express the same question, differing only in which table is preserved and therefore in table
+-- order. LEFT JOIN is preferred in practice because it keeps the anchor table in the first position, which
+-- reads top to bottom.
+SELECT f.title
+    FROM inventory AS i
+    RIGHT JOIN film AS f
+    ON i.film_id = f.film_id
+    WHERE i.inventory_id IS NULL;
+    
+-- The following code returns a list of movie title pairings that share the same length. Since both title
+-- and length live in the same table, the film table is referenced twice (f1 and f2) so its rows can be
+-- evaluated against each other. The WHERE clause with the < operator on film_id does two jobs at once.
+-- It eliminates self-pairings, since a film matched with itself has equal ids that fail the less-than
+-- test, and it removes duplicate pairs (movie 1/movie 2 and movie 2/movie 1) by keeping only the ordering
+-- where f1.film_id < f2.film_id. film_id is used rather than title because it is the primary key and
+-- guaranteed unique.
+SELECT f1.title AS f1_title, f2.title AS f2_title, f1.length
+    FROM film AS f1
+    JOIN film AS f2
+    ON f1.length = f2.length
+    WHERE f1.film_id < f2.film_id
+    ORDER BY f1.length;
+    
+	
+
+-- -------------------------------------------------------------
+-- TIER 4: Subqueries
+-- Constructs: scalar subquery, IN subquery, correlated subquery,
+--             EXISTS, NOT EXISTS, derived table in FROM
+-- -------------------------------------------------------------
+
+-- The following code returns the titles in the title column and the rental rate from
+-- the rental_rate column where the rental rates are higher than the average rate.
+-- In order to know what the average rental rate is, a subquery was used in the comparison
+-- logic. This subquery finds the rental rate averages for all the films, and then the 
+-- main query uses this value for the comparison logic in the WHERE clause. NOTE: the 
+-- special thing learned from this scalar subquery is that the logic within () is only computed
+-- once since the average of the table is not going to change
+SELECT title, rental_rate
+FROM film 
+WHERE rental_rate > (SELECT AVG(rental_rate) FROM film);
+
+-- The following code returns the first and last names of customers who live in a city located in India.
+-- The subquery answers one question on its own, which cities are in India, by joining city to country and
+-- returning those city_ids. The main query joins customer to address to get each customer's city_id, and
+-- the IN check keeps only the customers whose city_id shows up in the India list. The subquery returns
+-- city_id rather than address_id because being in India is a property of the city, so that is the level
+-- the filter should live at. = 'India' is used instead of LIKE 'india' since an exact match is wanted, and
+-- LIKE with no wildcard is just a slower way of writing =. The capital I matters so it matches the value
+-- stored in the table.
+SELECT c.first_name, c.last_name
+    FROM customer AS c
+    JOIN address AS a ON a.address_id = c.address_id
+    WHERE a.city_id IN (
+        SELECT ci.city_id
+        FROM city AS ci
+        JOIN country AS co ON co.country_id = ci.country_id
+        WHERE co.country = 'India'
+    );
+
+-- This is an alternate version of the query above. It cuts the four-table chain at a different point.
+-- Here the subquery handles address, city, and country and returns address_ids, so the main query only
+-- needs the customer table. Both return the same result. The difference is where the join work happens.
+SELECT first_name, last_name
+	FROM customer
+    WHERE address_id IN (
+		SELECT a.address_id
+		FROM address as a
+		JOIN city as ci ON ci.city_id = a.city_id
+		JOIN country as co ON co.country_id = ci.country_id
+		WHERE co.country LIKE 'India');
+
+-- The following code returns films whose rental rate is higher than the average rental rate for their own
+-- rating. This needs a correlated subquery because the benchmark changes per film. A PG film gets compared
+-- to the PG average, an R film to the R average. The subquery references f1.rating from the outer query, so
+-- it cannot run by itself and re-runs for each film using that film's rating. The WHERE inside
+-- (f1.rating = f2.rating) narrows the inner rows down to just the films with the same rating, and AVG then
+-- gives one number for that rating. I originally tried GROUP BY plus HAVING here, but that was wrong. Since
+-- only one aggregated value is wanted, GROUP BY is not needed. Filtering with WHERE first means the average
+-- only ever sees one rating's worth of films.
+SELECT f1.title, f1.rental_rate, f1.rating
+    FROM film AS f1
+    WHERE f1.rental_rate > (
+        SELECT AVG(f2.rental_rate)
+        FROM film AS f2
+        WHERE f1.rating = f2.rating
+    );
+    
+-- The following code returns the first and last name of customers who have made at least one payment.
+-- For each customer, the subquery checks the payment table for a row matching that customer's id. EXISTS
+-- returns true or false based on whether the subquery returns any rows, and it stops as soon as the first
+-- match is found. SELECT * is used inside because EXISTS only checks whether rows are returned, not what
+-- those rows contain.
+SELECT c.first_name, c.last_name
+    FROM customer as c
+    WHERE EXISTS (
+        SELECT *
+        FROM payment as p
+        WHERE c.customer_id = p.customer_id);
+ 
+-- The following code returns the first and last names of customers who have made no payment. This is the
+-- reverse of the previous query. NOT EXISTS keeps the customer only when the subquery returns nothing.
+-- This is an anti-join, the same idea as the films with no inventory query from Tier 3. Every customer in
+-- Sakila has payments, so this returns zero rows, which is the correct result rather than an error.
+-- NOTE on NOT IN versus NOT EXISTS: this could be written with NOT IN against a subquery of payment
+-- customer_ids, but NOT IN returns wrong results if that list contains a NULL. SQL cannot resolve "not
+-- equal to NULL" as true or false, it returns UNKNOWN, so a single NULL causes NOT IN to return no rows at
+-- all. NOT EXISTS tests whether rows exist rather than comparing values, so a NULL cannot break it. NOT IN
+-- is a comparison operator. EXISTS is a presence operator.
+SELECT c.first_name, c.last_name
+    FROM customer AS c
+    WHERE NOT EXISTS (
+        SELECT *
+        FROM payment AS p
+        WHERE c.customer_id = p.customer_id
+    );
+ 
+-- The following code returns the customer_id and total amount paid for customers whose total payments
+-- exceed 150 dollars. The total is computed inside a derived table, which is a subquery placed in the FROM
+-- clause. The derived table must be given an alias (cust_payment) or MySQL will error. HAVING is used
+-- rather than WHERE because SUM is an aggregate and can only be filtered after grouping.
+-- NOTE: this derived table is actually redundant. The outer query just re-selects the same values, so the
+-- inner query alone returns the same result. It is kept here to show the mechanism.
+SELECT customer_id, tot_pay
+    FROM (
+        SELECT customer_id, SUM(amount) AS tot_pay
+        FROM payment
+        GROUP BY customer_id
+        HAVING SUM(amount) > 150
+    ) AS cust_payment;
+ 
+ 
+-- The following code outputs the average total spending among higher-end customers, meaning those who
+-- spent more than 150 dollars. This is where a derived table actually earns its place. It computes an
+-- average of sums, an aggregate of an aggregate, which cannot be done in a single grouped query since
+-- AVG(SUM(amount)) is not allowed. The inner query produces each customer's total, and the outer query
+-- averages those totals. The outer query is doing real work the inner one cannot do on its own.
+SELECT AVG(tot_pay) AS average_pay
+    FROM (
+        SELECT SUM(amount) AS tot_pay
+        FROM payment
+        GROUP BY customer_id
+        HAVING SUM(amount) > 150
+    ) AS cust_payment;
+ 
+-- -------------------------------------------------------------
+-- TIER 5: CTEs
+-- Constructs: single CTE, chained CTEs, CTE vs subquery judgment
+-- -------------------------------------------------------------
+
+
+-- The following code returns the average total spending among higher-end customers (i.e., those who spent
+-- more than 150 dollars). It is the same logic as the derived table version above, rewritten as a CTE. The
+-- WITH block defines a named result set that groups payment by customer_id, sums each customer's payments,
+-- and uses HAVING to keep only totals above 150. The main query then takes AVG over those totals. A CTE and
+-- a derived table produce the identical result. The difference is only structure. The CTE lifts the subquery
+-- out of the FROM clause, names it, and defines it up front, so the query reads top to bottom instead of
+-- inside out.
+WITH high_spender_totals AS (
+    SELECT SUM(amount) AS total_paid
+    FROM payment
+    GROUP BY customer_id
+    HAVING SUM(amount) > 150
+)
+SELECT AVG(total_paid) AS avg_high_spender_pay
+    FROM high_spender_totals;
+ 
+ 
+-- The following code returns the average number of films per category, counting only categories that have
+-- more than 50 films. The CTE joins category to the film_category junction table, groups by category name,
+-- counts the films in each category, and uses HAVING to keep only categories with more than 50 films. That
+-- gives one row per qualifying category with its film count. The main query then takes AVG over the
+-- film_count column with no GROUP BY, which collapses all the qualifying categories into a single number.
+-- NOTE: the join to film_category is doing real work here. Counting from the category table alone would
+-- return 1 for every category, since category has one row per category. The join pairs each category with
+-- all its films, which is what gives COUNT something real to count.
+WITH large_categories AS (
+    SELECT c.name AS category_name, COUNT(fc.film_id) AS film_count
+    FROM category AS c
+    JOIN film_category AS fc ON c.category_id = fc.category_id
+    GROUP BY category_name
+    HAVING film_count > 50
+)
+SELECT AVG(film_count) AS avg_films_per_category
+    FROM large_categories;
+ 
+ 
+-- The following code returns the single category with the highest average rental rate among its films, along
+-- with that average. It uses two chained CTEs. The first pairs each category name with its film_ids. The
+-- second reads from the first, joins it to the film table on film_id to reach each film's rental rate, then
+-- groups by category name and averages the rental rates. The main query orders by average rental rate
+-- descending and uses LIMIT 1 to keep only the top row. ORDER BY plus LIMIT 1 is the standard way to select
+-- the single highest of something, and it avoids the problem of pairing a MAX aggregate with a
+-- non-aggregated category name.
+-- NOTE: if two categories tied for the highest average, LIMIT 1 would arbitrarily return only one of them
+-- and hide the tie. A window function (RANK) would be needed to keep all tied rows.
+WITH category_films AS (
+    SELECT c.name AS category_name, fc.film_id
+    FROM category AS c
+    JOIN film_category AS fc ON c.category_id = fc.category_id
+),
+category_avg_rates AS (
+    SELECT category_films.category_name,
+           AVG(f.rental_rate) AS avg_rental_rate
+    FROM film AS f
+    JOIN category_films ON category_films.film_id = f.film_id
+    GROUP BY category_films.category_name
+)
+SELECT category_name, avg_rental_rate
+    FROM category_avg_rates
+    ORDER BY avg_rental_rate DESC
+    LIMIT 1;
+    
+-- -------------------------------------------------------------
+-- TIER 6: Window Functions
+-- Constructs: ROW_NUMBER, RANK, DENSE_RANK, PARTITION BY,
+--             running totals, LAG, LEAD, top-N-per-group pattern
+-- -------------------------------------------------------------
+
+-- The following code outputs the title, rating, and rental rate of every film, along with the average rental
+-- rate for that film's rating category, while keeping all 1000 film rows. A window function performs its
+-- calculation without collapsing rows, unlike GROUP BY, which would reduce the output to one row per rating.
+-- AVG is the function, OVER is the clause that turns it into a window function, and PARTITION BY inside OVER
+-- defines the set of rows each calculation looks at. PARTITION BY rating scopes the average to the rows
+-- sharing that film's rating, so each film is stamped with its own category's average. Two films with the
+-- same rating show the same value, since the average is computed over the same partition for both.
+SELECT title, rating, rental_rate, AVG(rental_rate) OVER (PARTITION BY rating) AS avg_rental_rate
+FROM film;
+
+-- The following code outputs the title, rating, and rental rate of every film along with a sequential number
+-- ranking each film within its rating category from most to least expensive. ROW_NUMBER assigns a unique
+-- number to each row rather than aggregating. PARTITION BY rating restarts the numbering for each rating
+-- category, and the ORDER BY inside the OVER clause determines the sequence within each partition. Because
+-- rental rate takes only three values, many films tie, and ROW_NUMBER breaks those ties arbitrarily since no
+-- tiebreaker column was specified.
+SELECT title,
+       rating,
+       rental_rate,
+       ROW_NUMBER() OVER (PARTITION BY rating ORDER BY rental_rate DESC) AS price_rank_in_rating
+    FROM film;
+    
+
+-- The following code outputs the title, rating, and rental rate of every film alongside three ranking columns
+-- that share the same window, so their handling of ties can be compared side by side. ROW_NUMBER assigns a
+-- unique sequential number and ignores ties, so tied rows are ordered arbitrarily unless a tiebreaker is added
+-- to the ORDER BY. RANK gives tied rows the same value and then skips ahead, leaving gaps that reflect how many
+-- rows were tied above. DENSE_RANK gives tied rows the same value with no gaps, so its numbers count distinct
+-- values rather than rows.
+SELECT title,
+       rating,
+       rental_rate,
+       RANK() OVER (PARTITION BY rating ORDER BY rental_rate DESC) AS rank_by_rating,
+       DENSE_RANK() OVER (PARTITION BY rating ORDER BY rental_rate DESC) AS dense_rank_in_rating,
+       ROW_NUMBER() OVER (PARTITION BY rating ORDER BY rental_rate DESC) AS row_num_in_rating
+    FROM film;
+
+
+-- The following code outputs each payment made by customer 1 in chronological order, alongside the amount of
+-- that customer's previous payment. LAG reaches back to a prior row within the partition rather than
+-- aggregating across rows. The ORDER BY inside the OVER clause defines what previous means, so it is required
+-- rather than optional. The first payment has no prior row, so LAG returns NULL there. A default value of 0
+-- was deliberately not used, because 0 would assert that the previous payment was zero dollars rather than
+-- that no previous payment exists.
+SELECT payment_date,
+       amount, 
+       LAG(amount, 1) OVER (PARTITION BY customer_id ORDER BY payment_date) AS previous_payment
+	FROM payment
+	WHERE customer_id = 1;
+
+-- The following code outputs the payment date, amount, previous payment amount, and the change between the two
+-- for customer 1. In order to do this, LAG was used to pull the amount from the previous row. Subtracting the
+-- lagged amount from the current amount gives the change. The first row returns NULL for both columns since
+-- there is no previous payment, and arithmetic with NULL returns NULL. A named window (w) was used so the OVER
+-- clause does not have to be written twice.
+SELECT payment_date,
+       amount,
+       LAG(amount, 1) OVER w AS previous_payment,
+       amount - LAG(amount, 1) OVER w AS change_from_previous
+    FROM payment
+    WHERE customer_id = 1
+    WINDOW w AS (PARTITION BY customer_id ORDER BY payment_date);
+
+-- The following code outputs the payment date, amount, and a running total of everything customer 1 has paid
+-- up to and including that payment. In order to do this, SUM was used as a window function with an ORDER BY
+-- inside the window. The ORDER BY is what makes the sum accumulate, since it implicitly frames the window as
+-- everything from the start of the partition through the current row. Without the ORDER BY, SUM would return
+-- the customer's grand total on every row instead of a running total.
+SELECT payment_date,
+       amount,
+       SUM(amount) OVER w AS running_total
+    FROM payment
+    WHERE customer_id = 1
+    WINDOW w AS (PARTITION BY customer_id ORDER BY payment_date);
+
+-- The following code outputs the films occupying the top three price positions within each rating category.
+-- The window function was computed inside a CTE and then filtered in the outer query. Window functions are
+-- evaluated in the SELECT step, which runs after WHERE, so the rank column does not exist yet when WHERE runs
+-- and cannot be filtered there directly. Placing it in a CTE turns it into a plain column the outer query can
+-- filter normally.
+-- RANK gives tied films the same rank and then skips ahead. Since many films share the same rental rate, every
+-- film at the top price receives rank 1, so this returns all of them rather than three per rating.
+WITH ranking AS (
+    SELECT title,
+           rating,
+           rental_rate,
+           RANK() OVER (PARTITION BY rating ORDER BY rental_rate DESC) AS film_rank
+    FROM film
+)
+SELECT *
+    FROM ranking
+    WHERE film_rank IN (1, 2, 3);
+
+
+-- The following code outputs exactly three films per rating category, the three most expensive. This is the
+-- same CTE structure as above, but ROW_NUMBER is used instead of RANK. ROW_NUMBER assigns a unique number to
+-- every row and ignores ties, so filtering to three returns exactly three films per rating.
+-- NOTE: rental_rate only takes three values in Sakila, so many films tie at the top price. No tiebreaker was
+-- specified in the ORDER BY, so which three films come back is non-deterministic. The three films returned per
+-- rating are an arbitrary selection from a much larger tied group, and this result should not be presented as
+-- a meaningful ranking of top performers.
+WITH ranking AS (
+    SELECT title,
+           rating,
+           rental_rate,
+           ROW_NUMBER() OVER (PARTITION BY rating ORDER BY rental_rate DESC) AS film_rank
+    FROM film
+)
+SELECT *
+    FROM ranking
+    WHERE film_rank IN (1, 2, 3);
+
+-- -------------------------------------------------------------
+-- TIER 7: Conditional Logic
+-- Constructs: CASE in SELECT, CASE inside aggregation,
+--             CASE in ORDER BY
+-- -------------------------------------------------------------
+
+
+
+
+-- -------------------------------------------------------------
+-- TIER 8: Set Operations
+-- Constructs: UNION, UNION ALL, when to use each
+-- -------------------------------------------------------------
+
+
+
+
+-- -------------------------------------------------------------
+-- TIER 9: Synthesis
+-- Multi-construct queries combining all tiers.
+-- Example target: top-grossing category per country and the
+-- staff member who sold the most of it.
+-- -------------------------------------------------------------
