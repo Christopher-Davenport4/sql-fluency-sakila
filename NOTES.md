@@ -272,26 +272,27 @@ ties (like title) would wrongly drop genuine pairs that happen to share that val
 ---
 
 ## Tier 4: Subqueries
-A  subquery is a query nested inside another query.
+
+**A subquery is a query nested inside another query.**
 The inner query runs and hands its result to the outer query to use. Useful for questions that
 are naturally two-step: "customers who spent above average" = first compute the average, then
 find customers above it. Expressing both steps as one statement keeps it correct when data changes,
 instead of reading a number off the screen and pasting it into a second query by hand.
 
-Scalar subquery: returns ONE value, runs ONCE.
-WHERE rental_rate > (SELECT AVG(rental_rate) FROM film). The inner query computes a single value
+**Scalar subquery: returns ONE value, runs ONCE.**
+`WHERE rental_rate > (SELECT AVG(rental_rate) FROM film)`. The inner query computes a single value
 (one row, one column) a single time, and that value sits in the WHERE clause as a constant while the
 outer query scans every row against it. It runs once, not once per row, because its answer is a
 property of the whole table and does not change from row to row. This "runs once" behavior is the
 key contrast with correlated subqueries (which re-run per outer row).
 
-IN subquery: returns a LIST, tested for membership.
+**IN subquery: returns a LIST, tested for membership.**
 Same IN keyword as Tier 1, but instead of a hand-typed list, a subquery generates it.
-WHERE a.city_id IN (SELECT ci.city_id FROM city ci JOIN country co ... WHERE co.country = 'India').
+`WHERE a.city_id IN (SELECT ci.city_id FROM city ci JOIN country co ... WHERE co.country = 'India')`.
 The subquery should return the column at the level where the filter logic actually lives (city_id,
 because "being in India" is a property of a city), and answer one self-contained question.
 
-Where to "cut" a multi-table chain: a real design judgment.
+**Where to "cut" a multi-table chain: a real design judgment.**
 For a four-table chain (customer -> address -> city -> country), you can split the work between the
 outer query and the subquery at different points. One version keeps customer alone in the outer query
 and puts the other three tables in the subquery (returning address_id). Another joins customer+address
@@ -300,31 +301,222 @@ cut point. The cleaner cut is the one where each piece expresses one clear idea:
 exactly "which cities are in India" (city + country only). No single right answer; it is a readability
 judgment. Recognizing this tradeoff is a fluency marker.
 
-LIKE without a wildcard is a disguised equality.
-LIKE 'india' with no % behaves like = 'india', so the LIKE signals unclear intent. Use = for an
-exact match. Also match the stored casing: = 'India', not 'india'. A lowercase value only works
+**LIKE without a wildcard is a disguised equality.**
+`LIKE 'india'` with no % behaves like `= 'india'`, so the LIKE signals unclear intent. Use `=` for an
+exact match. Also match the stored casing: `= 'India'`, not `'india'`. A lowercase value only works
 because MySQL's default collation is case-insensitive; under a case-sensitive collation it would
 silently return zero rows.
 
-A table can be joined purely as scaffolding, never displayed.
+**A table can be joined purely as scaffolding, never displayed.**
 Tables appear in a query for one of two reasons: to provide columns you want to SELECT, or to provide
 a PATH to a column you want to filter or join on. In the India query, the address table is joined only
 to reach city_id for the filter; not one of its columns is selected. This breaks the beginner
 assumption that every joined table must contribute a visible column. Connector/bridge tables earn
 their place by connecting things, not by showing data.
-- Junction tables are the clearest example: joining actor to film through film_actor never selects
-anything FROM film_actor. It exists purely to bridge the two tables you actually care about.
-Same principle as the address bridge, just for a many-to-many relationship.
+    - Junction tables are the clearest example: joining actor to film through film_actor never selects
+      anything FROM film_actor. It exists purely to bridge the two tables you actually care about.
+      Same principle as the address bridge, just for a many-to-many relationship.
+
+**EXISTS / NOT EXISTS test row PRESENCE, not values.**
+EXISTS asks one thing: did the subquery return any rows, yes or no. It stops at the first match and
+does not care what the rows contain, so SELECT * or SELECT 1 inside behaves identically. EXISTS keeps
+the outer row when a match is found; NOT EXISTS keeps it when no match is found. The subquery in an
+EXISTS is a FILTER, not a data SOURCE: its contents (including any NULLs) are never returned to the
+outer query. Only the true/false verdict crosses the boundary. The outer row's displayed columns come
+from the outer table directly, never from the subquery.
+
+**NOT EXISTS as an anti-join.**
+NOT EXISTS finds "rows with no match," the same idea as the LEFT JOIN + IS NULL anti-join from Tier 3.
+For "customers who made no payment," the subquery looks for a matching payment and NOT EXISTS keeps
+the customer only when none is found. In Sakila every customer has payments, so this correctly returns
+zero rows (a valid answer, not a broken query).
+
+**NOT IN vs NOT EXISTS, and three-valued logic. (The key gotcha of the tier.)**
+SQL uses THREE truth values: true, false, and UNKNOWN. Any comparison against NULL returns UNKNOWN,
+because NULL means "unknown value" (a sealed box). You cannot confirm a known value equals it, and you
+also cannot confirm it is NOT equal to it, so both `= NULL` and `<> NULL` return UNKNOWN.
+    - NOT IN expands to a chain of <> joined by AND: `5 NOT IN (1, 2, NULL)` becomes
+      `5<>1 AND 5<>2 AND 5<>NULL`. The last term is UNKNOWN, and `true AND UNKNOWN` = UNKNOWN. A row is
+      only returned when WHERE is TRUE, and UNKNOWN is not true, so the row is dropped. A single NULL in
+      the list therefore makes NOT IN return NO rows at all, silently.
+    - NOT EXISTS is safe because it tests row presence, not value equality. No comparison against NULL
+      ever happens on the outer side, so nothing gets poisoned. A NULL inside the subquery just fails
+      the join condition like any other non-match.
+    - Rule: for an anti-join where the tested column could contain NULLs, use NOT EXISTS. NOT IN is only
+      safe when the subquery column is guaranteed non-NULL.
+    - The one-liner: NOT IN is a COMPARISON operator; EXISTS/NOT EXISTS is a PRESENCE operator.
+
+**Finding NULLs: use IS NULL / IS NOT NULL, never = NULL.**
+Because `column = NULL` returns UNKNOWN for every row (and finds nothing), NULLs need a dedicated
+presence test. IS NULL asks "is there a sealed box here," a yes/no that returns true or false and never
+gets stuck. This is why SQL had to invent a separate operator. In messy real-world data, "missing" can
+also be an empty string '' or whitespace, which are real known values that slip past IS NULL, so you
+sometimes check `WHERE col IS NULL OR col = ''`. The `= ''` works because an empty string is a known
+value, not the sealed box; only NULL forces the special IS NULL treatment.
+
+**Derived table: a subquery in the FROM clause.**
+Every other subquery so far lived in WHERE. A derived table sits in FROM, and its result set is treated
+like a temporary table the outer query can select from, filter, and join to. It MUST have an alias or
+MySQL errors. Use it when you need to aggregate first and then work with the aggregated results.
+    - Key insight: once the derived table runs, an aggregate like SUM(amount) AS tot_pay becomes a PLAIN
+      COLUMN of the temporary table, with no memory it was ever an aggregate. So the outer query can
+      filter it with an ordinary `WHERE tot_pay > 150`, even though `WHERE SUM(amount) > 150` is illegal
+      inside (WHERE runs before grouping, so the aggregate does not exist yet).
+    - This gives a THIRD way to filter on an aggregate: HAVING inside, OR push the aggregate into a
+      derived table and filter with WHERE outside. Same result, two routes; pick whichever reads cleaner.
+    - Derived tables are the bridge into Tier 5 CTEs (a CTE is a named, more readable derived table).
 
 ---
 
 ## Tier 5: CTEs
-*(to be filled as queries are written)*
+
+**A CTE is a named temporary result set defined up front with WITH.**
+`WITH name AS ( subquery ) SELECT ... FROM name`. The CTE runs first and hands its result to the main
+query, which is why the main query can reference the name as if it were a real table. Once defined, a
+CTE behaves like a table anywhere a table name could go: FROM, JOIN, subqueries.
+
+**A CTE is a derived table, pulled out of FROM and named.**
+Same result, same work, different structure. A derived table nests the subquery inside FROM so you
+read inside-out. A CTE lifts it out and names it, so the query reads top-to-bottom. For one small
+step the two are interchangeable and it is a style call.
+
+**Where CTEs actually beat derived tables:**
+- Multi-step logic becomes separate named blocks instead of subqueries nested three deep.
+- A CTE can be referenced MORE THAN ONCE in the main query. A derived table exists only at its one
+  spot in FROM.
+
+**Chained CTEs: the second reads FROM the first.**
+`WITH a AS (...), b AS (...)` with one WITH at the top, CTEs separated by commas, and the last one
+before the main query omitting the comma. Each CTE can only reference CTEs defined before it.
+Conceptually the same as the `%>%` pipe in R: sequential steps, each building on the last.
+
+**Build chained CTEs by working backwards.**
+Figure out what the final result needs to look like, then what feeds it, then what feeds that. Each
+layer becomes a CTE. This decomposition is the actual skill; the syntax is trivial once the steps are
+clear.
+
+**A wrapping layer (CTE or derived table) must earn its place.**
+It is REDUNDANT when the outer query just re-selects the inner results unchanged. If running the inner
+query alone gives the same answer, drop the wrapper and write the simpler query.
+It is NECESSARY when the outer query transforms, aggregates, joins, or ranks the inner result.
+Classic necessary case: AVG of SUM. `AVG(SUM(amount))` is illegal in one grouped query, so SUM inside
+and AVG outside.
+
+**Selecting the single top row: ORDER BY ... DESC LIMIT 1.**
+This is the standard idiom for "the highest" of anything. It avoids the trap of pairing a MAX aggregate
+with a non-aggregated column, because it sorts and takes the top rather than aggregating.
+Blind spot: if two rows tie for the top, LIMIT 1 arbitrarily returns one and silently hides the tie. To
+keep ties, use a window function (RANK). See Tier 6.
+
+**The grouping-vs-summarizing mistake. (Cost me real time.)**
+"Average number of films per category" wants ONE number. Leaving `GROUP BY category_name` in the main
+query returns one row per category instead, and the AVG does nothing because averaging a single value
+returns that same value. The diagnostic: if AVG of a group returns the group's own number back
+unchanged, the GROUP BY is defeating the aggregate. Drop it and let the aggregate collapse the whole
+set.
+
+**COUNT depends on "rows of what?"**
+Counting from a lookup table alone (e.g. `SELECT COUNT(name) FROM category GROUP BY name`) returns 1
+per entity, because that table has one row per entity. The join to the junction/detail table is what
+expands one category row into one row per film, which gives COUNT something real to count.
+Diagnostic: if every count is 1 and a `HAVING > 50` wipes the result to empty (so AVG returns NULL),
+you counted the lookup table instead of the detail rows.
+`COUNT(fc.film_id)` is more honest than `COUNT(c.name)` after the join, since it says "I am counting
+films."
+
+**Naming for readability.**
+The test: read ONLY the main query. If you can tell what it does from the names alone, without
+scrolling up to decode a CTE, the naming is good.
+- Name CTEs for their contents, not their position. `category_avg_rates`, not `t1`/`t2`/`temp`/`beans`.
+  A CTE is a noun; name it like the result set it holds.
+- Keep column aliases consistent. One name for one concept across the whole query, not `cat_name` in
+  one CTE and `categories` in the next for the same thing.
+- Match singular/plural to what the column holds. `avg_rental_rate` is one value per row, so singular.
+- Short table aliases are fine for base tables (`c`, `fc`, `f`). Save descriptive naming for CTEs.
+- snake_case, no spaces or capitals, or the alias needs backticks everywhere downstream.
+- Descriptive does not mean long. Two or three words. `category_avg_rates` is good;
+  `the_average_rental_rate_for_each_category` is worse than `t2`.
 
 ---
 
 ## Tier 6: Window Functions
-*(to be filled as queries are written)*
+
+**The core distinction: GROUP BY reduces rows, window functions preserve them.**
+An aggregate with GROUP BY collapses many rows into one per group. A window function performs the
+same calculation without collapsing anything: every original row survives and the computed value is
+attached as a new column on each row. `AVG(rental_rate) OVER (PARTITION BY rating)` returns all 1000
+films, each stamped with its own rating's average.
+
+**Terminology precision.**
+`AVG()` is the function (an ordinary aggregate). `OVER()` is a CLAUSE that turns it into a window
+function. `PARTITION BY` is a component INSIDE the OVER clause that defines which rows each
+calculation looks at. Neither OVER nor PARTITION BY is itself a function. The window function is the
+whole expression: `AVG(x) OVER (...)`.
+
+**PARTITION BY is the window-function cousin of GROUP BY.**
+It scopes the calculation to a group the same way GROUP BY does, but preserves the rows. Every row in
+the same partition receives the same value for an aggregate window function. That repetition across
+rows is the visible signature of a window function.
+
+**The three ranking functions differ only in how they handle ties.**
+- `ROW_NUMBER()` assigns a unique sequential number (1, 2, 3, 4), ignoring ties. Which tied row gets
+  the lower number is NON-DETERMINISTIC unless a tiebreaker is added to the ORDER BY inside OVER.
+- `RANK()` gives tied rows the same value, then skips ahead. Three rows tied at the top all get 1 and
+  the next row gets 4. The gaps reflect how many rows were tied above.
+- `DENSE_RANK()` gives tied rows the same value with no gaps. Three tied at the top all get 1 and the
+  next row gets 2. Its numbers count distinct values rather than rows.
+
+**Never rely on incidental ordering.**
+If tied rows happen to come back alphabetical, that is an artifact of physical row order or which
+index the engine scanned, not a rule. Add an explicit tiebreaker (`ORDER BY rate DESC, title`) so the
+ordering is deterministic and documented.
+
+**"Top 3" is ambiguous until tie handling is decided.**
+`DENSE_RANK() <= 3` returns the top three distinct VALUES (row count varies with repetition in the
+data). `RANK() <= 3` returns every row occupying the top three positions. `ROW_NUMBER() <= 3` returns
+exactly three rows, arbitrarily breaking ties. In Sakila, rental_rate has only three distinct values,
+so "top 3 most expensive films per rating" is not a meaningful question: DENSE_RANK returns all 1000
+films, RANK returns 336, and ROW_NUMBER returns an arbitrary 15. The right move is to go back to the
+stakeholder rather than hand them an arbitrary list labeled "top performers."
+
+**LAG and LEAD reach out to neighboring rows.**
+Unlike other window functions, these do not compute over a set; they grab a value from a specific
+other row in the partition. `LAG(col)` pulls from the previous row, `LEAD(col)` from the next. The
+ORDER BY inside OVER is what defines "previous" and "next," so it is required, not optional. The
+first row of a partition has no previous row, so LAG returns NULL there.
+
+**The NULL-vs-zero-default judgment. (A real data integrity point.)**
+`LAG(col, 1, 0)` substitutes 0 when no previous row exists. Only use a 0 default when zero is a real
+MEASUREMENT, not a placeholder for unknown. A running count of prior events genuinely starts at zero.
+A previous payment amount does not: defaulting to 0 asserts the previous payment WAS zero dollars
+rather than that none exists. Leaving it NULL is truthful, and NULL propagates through arithmetic, so
+`amount - LAG(amount)` correctly returns NULL on the first row instead of fabricating a change from
+nothing. Encoding missingness as a number (0, 99, -1) silently corrupts any average or sum over that
+column. This is a classic data-cleaning trap.
+
+**ORDER BY inside OVER is what makes SUM accumulate.**
+`SUM(x) OVER (PARTITION BY g)` returns the partition's grand total, stamped identically on every row.
+`SUM(x) OVER (PARTITION BY g ORDER BY d)` returns a RUNNING total. Adding the ORDER BY implicitly
+frames the window as "from the start of the partition through the current row." Same function, same
+partition, entirely different result.
+
+**Named windows remove duplication.**
+`SELECT LAG(x) OVER w, SUM(x) OVER w FROM t WINDOW w AS (PARTITION BY g ORDER BY d)`. The WINDOW
+clause defines the window once and names it. It goes after WHERE and before ORDER BY. MySQL 8.0
+supports this.
+
+**You CANNOT filter a window function in WHERE. (The tier's central mechanical lesson.)**
+Window functions are evaluated in the SELECT step, which runs AFTER WHERE. So the column does not
+exist yet when WHERE runs. `WHERE film_rank <= 3` throws "unknown column." HAVING fails for the same
+reason (it also runs before SELECT). This follows directly from the logical processing order:
+FROM, WHERE, GROUP BY, HAVING, SELECT, ORDER BY.
+
+**The fix, and the top-N-per-group pattern.**
+Compute the window function inside a CTE or derived table, which materializes it as a plain column of
+that result set. Then the outer query filters it with an ordinary WHERE. This is the same insight as
+aggregates in derived tables: once inside, it stops being a live window function and becomes a normal
+column. Rank inside the CTE, `WHERE rank <= N` outside. This single fact explains most window function
+errors people hit in practice.
 
 ---
 
