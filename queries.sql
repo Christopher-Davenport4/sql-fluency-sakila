@@ -566,16 +566,105 @@ SELECT *
 --             CASE in ORDER BY
 -- -------------------------------------------------------------
 
+-- The following code returns the title and length of every film, along with a label classifying the film
+-- as short, medium, or long based on its runtime. This is accomplished with a searched CASE, which checks
+-- each WHEN condition from top to bottom and stops at the first one that matches. Because the first WHEN
+-- already accounts for every film under 60 minutes, the second WHEN only needs to state its upper bound.
+-- Writing length >= 60 AND length <= 120 would be redundant. The ELSE clause captures everything over 120
+-- minutes. If no ELSE were included, any film that matched none of the conditions would return NULL.
+SELECT title, length,
+	CASE WHEN length < 60 THEN 'short' WHEN length <= 120 THEN 'medium' ELSE 'long' END AS length_classifier
+ 	FROM film;
+    
+-- The following code returns one row per rating, showing the total number of films with that rating
+-- and the number of those films that are over 120 minutes long. This is accomplished by placing a CASE
+-- inside the COUNT function. Aggregate functions ignore NULL values, and a CASE with no ELSE will
+-- return NULL for any row that does not meet the condition. This means COUNT will only count the films
+-- that matched. The value placed after THEN does not matter because COUNT is only checking that a value
+-- is not NULL. A WHERE clause could not be used here since it would remove the short films from the
+-- entire query, and they are still needed for the total count.
+SELECT rating, 
+count(*) as Film_Count,
+count(case when length > 120 THEN 1 END) as film_over_120min
+from film
+group by rating;
 
 
+-- The following code returns the proportion of films within each rating that are over 120 minutes long.
+-- This is done by dividing the conditional count by the total count. The division operator in MySQL
+-- returns a decimal value, so no casting is needed.
+SELECT rating, 
+count(*) as Film_Count,
+count(case when length > 120 THEN 1 END) / count(*) as prop_over_120min
+from film
+group by rating;
+
+
+-- The following code returns the same proportion as above, but uses a single aggregate function instead
+-- of two. AVG adds up the values it receives and divides by how many values it saw, so a column made up
+-- of 1s and 0s will average to the proportion of 1s. The ELSE 0 is necessary here. Without it, the films
+-- under 120 minutes would return NULL, and AVG would drop them entirely. It would then divide the sum of
+-- the 1s by the count of the 1s, which returns 1.0 for every rating. This would not produce an error, but
+-- the output would be wrong. The ELSE clause determines whether the non-matching rows are included in the
+-- denominator. Since COUNT should not see those rows, no ELSE is used. Since AVG needs those rows present
+-- as zeros, ELSE 0 is used.
+SELECT rating,
+       AVG(CASE WHEN length > 120 THEN 1 ELSE 0 END) AS prop_over_120min
+    FROM film
+    GROUP BY rating;
+
+-- The following code returns every distinct rating from the film table, sorted from least restrictive to
+-- most restrictive rather than alphabetically. Sorting on the rating column directly would produce G,
+-- NC-17, PG, PG-13, R, which is not a meaningful order. Placing a CASE inside the ORDER BY assigns each
+-- rating a sort position, and SQL then orders by that computed number instead of the text itself. The
+-- simple CASE form is used here, which names the column once and then compares it against each literal
+-- value. This works because every condition is checking the same column against a fixed value. No ELSE
+-- clause was included. If a rating appeared that was not listed, the CASE would return NULL for it, and
+-- MySQL sorts NULL values first in ascending order, so that rating would appear at the top of the list.
+SELECT DISTINCT rating
+	FROM film
+    ORDER BY CASE rating WHEN 'G' THEN 1 WHEN 'PG' THEN 2 WHEN 'PG-13' THEN 3 WHEN 'R' THEN 4 WHEN 'NC-17' THEN 5 END;
 
 -- -------------------------------------------------------------
 -- TIER 8: Set Operations
 -- Constructs: UNION, UNION ALL, when to use each
 -- -------------------------------------------------------------
 
+-- The following code returns a combined list of every person in the staff and customer tables, along
+-- with a column indicating which table each row came from. UNION stacks the results of two queries
+-- vertically, adding rows rather than columns the way a JOIN would. Both queries must return the same
+-- number of columns with compatible types, and the column names are taken from the first query, so the
+-- alias in the second query is ignored. The table_origin column is a hardcoded string literal rather
+-- than a column from either table. UNION removes duplicate rows, but it compares entire rows rather than
+-- individual columns, so no rows are removed here. Even if a staff member and a customer shared a name,
+-- the table_origin values would differ and the rows would not match. Since duplicates are not possible
+-- in this query, UNION ALL would return the same 601 rows without performing the deduplication step.
+SELECT first_name, last_name, 'staff' as table_origin
+	from staff
+    UNION
+SELECT first_name, last_name, 'customer' as table_origin
+	from customer;
 
 
+-- The following code shows the difference between UNION and UNION ALL. Each query returns the customer_id
+-- column from the rental table and the payment table. UNION ALL returns 32088 rows, which is the 16044
+-- rentals plus the 16044 payments, since it keeps every row from both queries. Customer ids repeat many
+-- times because customers rent and pay more than once. UNION returns 599 rows because it removes all
+-- duplicates from the combined result, leaving one row per distinct customer id. That number matches the
+-- row count of the customer table, which means every customer has at least one rental and one payment.
+-- UNION ALL should be used unless duplicates specifically need to be removed, since the deduplication
+-- step has a cost.
+SELECT customer_id
+	FROM rental
+    UNION ALL
+SELECT customer_id
+	FROM payment;
+
+SELECT customer_id
+	FROM rental
+    UNION
+SELECT customer_id
+	FROM payment;
 
 -- -------------------------------------------------------------
 -- TIER 9: Synthesis
@@ -583,3 +672,110 @@ SELECT *
 -- Example target: top-grossing category per country and the
 -- staff member who sold the most of it.
 -- -------------------------------------------------------------
+-- Question 1: For each country, find the single top-grossing film category, meaning the category whose
+-- films generated the most total payment revenue from customers in that country. Return the country, the
+-- category, and that total revenue.
+
+-- The following code returns one row per country showing its top-grossing category. Payment is the anchor
+-- table because it holds the amount being measured and carries a foreign key to both directions needed
+-- here. The customer_id fans out to the country chain (customer, address, city, country) and the rental_id
+-- fans out to the category chain (rental, inventory, film, film_category, category). The first CTE groups
+-- by country and category and sums the payment amounts, which produces one row per country-category pair.
+-- The second CTE reads from the first and applies ROW_NUMBER partitioned by country, so the ranking
+-- restarts for each country and rank 1 is that country's highest-grossing category. The ranking has to be
+-- computed in a CTE because window functions are evaluated in the SELECT step, which runs after WHERE, so
+-- the rank column does not exist yet and cannot be filtered in the same query.
+With country_category_revenue as (
+    SELECT country, category.name as category, SUM(amount) as revenue
+	FROM payment 
+    join customer on customer.customer_id = payment.customer_id
+    join address on address.address_id = customer.address_id
+    join city on city.city_id = address.city_id
+    join country on country.country_id = city.country_id
+    join rental on rental.rental_id = payment.rental_id
+    join inventory on inventory.inventory_id = rental.inventory_id
+    join film on film.film_id = inventory.film_id
+    join film_category on film_category.film_id = film.film_id
+    join category on category.category_id = film_category.category_id
+    group by country, category),
+    ranked_categories as (
+	SELECT country, category, revenue,
+		ROW_NUMBER() OVER (partition by country order by revenue DESC) as category_ranking
+        FROM country_category_revenue
+        )
+	SELECT country, category, revenue
+    FROM ranked_categories
+    WHERE category_ranking in (1);
+    
+
+-- Question 2: For each store, find the customer who has spent the most money there. 
+-- Return the store id, the customer's first and last name, and the total that customer spent at that store.
+
+-- The two queries below were used to work out which path to the store is the correct one. The customer
+-- table has its own store_id, but it holds one value per customer, meaning the store the customer is
+-- registered at rather than the store where a transaction happened. Joining through it would attribute
+-- every payment to the customer's home branch. Checking the data showed that customers do rent from both
+-- stores, so the two paths disagree and the customer.store_id path would produce wrong results.
+
+-- This outputs one store per customer. If customers made purchases at multiple stores, using this
+-- pathway to join the customers purchases by store would miss out on purchases made at stores
+-- not displayed in this connection.
+SELECT first_name, store_id
+	from customer;
+
+-- customer to payment table will link customers to multiple payments
+select c.first_name, p.payment_id
+	from customer as c
+    JOIN payment as p on p.customer_id = c.customer_id;
+
+-- The following code returns the top-spending customer at each store. The correct path to a store runs
+-- through inventory, since an inventory row is a physical copy that lives at a specific store, so it
+-- records where the transaction actually occurred. The chain runs store to inventory to rental to payment
+-- to customer. The first CTE groups by store and customer and sums the payment amounts, producing one row
+-- per customer per store. customer_id is included in the GROUP BY rather than relying on the names alone,
+-- because two different customers could share a first and last name and would otherwise be merged into one
+-- row. The second CTE applies RANK partitioned by store so the ranking restarts for each store. RANK was
+-- chosen over ROW_NUMBER so that if two customers tied for the highest spend at a store, both would be
+-- returned rather than one being dropped arbitrarily.
+WITH customer_store_totals as (
+select c.first_name, C.last_name, s.store_id, SUM(p.amount) as total_amount
+	from store as s
+    JOIN inventory on inventory.store_id = s.store_id
+    JOIN rental on rental.inventory_id = inventory.inventory_id
+    JOIN payment as p on p.rental_id = rental.rental_id
+    JOIN customer as c on c.customer_id = p.customer_id
+    -- WHERE c.first_name LIKE 'JOEL'
+    GROUP BY store_id, c.first_name, c.last_name, c.customer_id),
+ranked_spenders as (
+	SELECT *, RANK() OVER (partition by store_id ORDER BY total_amount DESC) as amount_ranking
+    FROM customer_store_totals)
+    SELECT *
+    FROM ranked_spenders
+    WHERE amount_ranking in (1);
+    
+-- The following code returns every category with its total revenue and the percentage of overall revenue
+-- that category represents, sorted from highest to lowest. The CTE joins payment out to category through
+-- the rental, inventory, film, and film_category chain, and sums the payment amounts for each category. A
+-- RIGHT JOIN is used on category so that any category with no payments is still returned. An inner join
+-- would drop it, since the chain starts at payment and a category with no payments has no payment row to
+-- ride in on. When a category has no matching payments, SUM returns NULL rather than 0, so the CASE
+-- converts that to 0. This matters because NULL propagates through arithmetic, and the percentage
+-- calculation in the main query would also return NULL. The main query then divides each category's
+-- revenue by the grand total, which is obtained with a scalar subquery. The total is a single value, so it
+-- does not need to be its own CTE or joined to anything. It can sit directly inside the expression the same
+-- way a scalar subquery sits inside a WHERE clause. Every category in Sakila has revenue, so no zero rows
+-- appear, but the query handles that case correctly if one existed.
+with category_revenue as (
+select 
+	(CASE WHEN SUM(p.amount) IS NULL THEN 0 ELSE SUM(p.amount) END) as category_amount, cat.name
+	from payment as p
+    JOIN rental on rental.rental_id = p.rental_id
+    JOIN inventory on inventory.inventory_id = rental.inventory_id
+    JOIN film on film.film_id = inventory.film_id
+    JOIN film_category on film_category.film_id = film.film_id
+    RIGHT JOIN category as cat on cat.category_id = film_category.category_id
+    GROUP BY cat.name)
+SELECT name, category_amount, 
+	(category_amount / (SELECT sum(category_amount) from category_revenue)) * 100 AS pct_total
+    FROM category_revenue
+    ORDER BY category_amount DESC;
