@@ -5,16 +5,18 @@ This project exists for one reason: to build genuine SQL fluency through deliber
 repeated practice against a real relational schema. No Python, no dashboards, no pipeline.
 Just a database and a growing file of SQL queries.
 
-This is a direct response to an honest self-assessment: prior projects involved JOINs,
-CTEs, and window functions once, with guidance, against a simple star schema. That is
-familiarity, not fluency. This project is structured to close that gap.
+This is a direct response to an honest self-assessment. Prior projects involved JOINs,
+CTEs, and window functions once, with guidance, against a simple star schema where almost
+everything joined on a single key. That is familiarity, not fluency. This project is
+structured to close that gap: every query here was written by hand, without generated code,
+against a schema with genuinely complex relationships.
 
 ---
 
 ## Dataset
 **Sakila** — MySQL's native sample database. A fictional DVD rental store with 16 base
-tables, multiple many-to-many relationships, and a four-table geographic chain. Designed
-to force multi-table JOINs, subqueries, aggregation, and logic constructs.
+tables, two many-to-many junction relationships, and a four-table geographic chain. Designed
+to force multi-table JOINs, subqueries, aggregation, and conditional logic.
 
 Canonical row counts (verified at load):
 | Table    | Expected | Loaded |
@@ -37,15 +39,19 @@ not a load error. Does not affect any query in this project.
 ---
 
 ## Setup — Reproducing This Environment
-1. Install MySQL Server and MySQL Workbench via the MySQL Installer for Windows (mysql-installer-community).
+1. Install MySQL Server and MySQL Workbench via the MySQL Installer for Windows (mysql-installer-community). Workbench alone is only a client and will not run without a server.
 2. During server configuration: choose Development Computer, strong password encryption, set root password, enable Windows service set to start at boot.
 3. Download the Sakila zip from https://dev.mysql.com/doc/index-other.html under Example Databases.
-4. Extract and load in order from the MySQL client using forward slashes in the path:
+4. Extract and load in order from the MySQL client, using forward slashes in the path (the MySQL client treats backslashes as escape characters):
    ```sql
    SOURCE C:/path/to/sakila-schema.sql;
    SOURCE C:/path/to/sakila-data.sql;
    ```
+   Schema first, then data. The data file assumes the tables already exist.
 5. Verify row counts against the table above before querying.
+
+The Sakila source files are not committed to this repo. They are publicly available from
+MySQL and are not original work, so the setup instructions above are the reproduction path.
 
 ---
 
@@ -63,6 +69,27 @@ not a load error. Does not affect any query in this project.
 | 8    | Set operations — UNION vs UNION ALL |
 | 9    | Synthesis — multi-construct queries combining all of the above |
 
+All nine tiers are complete.
+
+---
+
+## Tier 9: Synthesis Queries
+The final tier contains three multi-construct queries that combine the full progression:
+
+1. **Top-grossing category per country.** Nine joins fanning out from payment in two
+   directions (customer to country, rental to category), aggregated by country and category,
+   then ranked with ROW_NUMBER partitioned by country and filtered to rank 1.
+
+2. **Top-spending customer per store.** Required distinguishing `customer.store_id` (the
+   customer's registered home branch, one value each) from `inventory.store_id` (where the
+   transaction physically occurred). Checking the data confirmed the two frequently disagree,
+   so the naive path would attribute revenue to the wrong store. Uses RANK rather than
+   ROW_NUMBER so tied top spenders are both returned rather than one being dropped.
+
+3. **Revenue by category with percentage of total.** Uses a RIGHT JOIN to preserve categories
+   with zero revenue, COALESCE-equivalent CASE logic to convert the resulting NULL sum to 0,
+   and a scalar subquery for the grand total rather than a redundant CTE.
+
 ---
 
 ## Repository Structure
@@ -72,3 +99,11 @@ project3/
 ├── queries.sql        — all queries organized by tier with comments
 └── NOTES.md           — learning log, patterns, and gotchas
 ```
+
+`queries.sql` contains every query written for this project, grouped by tier, each preceded
+by a comment stating the question it answers and the reasoning behind the approach.
+
+`NOTES.md` is the learning log. It records the conceptual distinctions and gotchas that
+surfaced during the work — the datetime BETWEEN trap, why NOT IN breaks on NULLs and
+NOT EXISTS does not, why window functions cannot be filtered in WHERE, when a derived table
+is redundant versus necessary, and the store_id ambiguity in Tier 9.
