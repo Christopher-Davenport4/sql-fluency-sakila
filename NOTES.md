@@ -521,14 +521,143 @@ errors people hit in practice.
 ---
 
 ## Tier 7: Conditional Logic
-*(to be filled as queries are written)*
+
+**Two CASE forms.**
+Simple CASE names the column once and compares it against literals: `CASE rating WHEN 'G' THEN 1 ...`.
+Searched CASE takes a full condition in each WHEN: `CASE WHEN length < 60 THEN 'short' ...`. Searched is
+more flexible (ranges, multiple columns) and more common. Use simple when every branch tests the same
+column against a fixed value.
+
+**First match wins, so order the WHEN clauses from most restrictive outward.**
+Evaluation runs top to bottom and stops at the first match. This means each condition only has to state
+its upper bound, because the lower bound is guaranteed by what came before. `WHEN length < 60` then
+`WHEN length <= 120` is correct; writing `WHEN length >= 60 AND length <= 120` is redundant. Fewer places
+for a boundary error to hide.
+
+**No ELSE means NULL.**
+If no WHEN matches and there is no ELSE, the CASE returns NULL for that row. This is sometimes a bug and
+sometimes the entire point (see conditional aggregation below).
+
+**Watch the boundary.**
+`WHEN length <= 120` vs `< 120` decides which side a 120-minute film lands on. Same family of problem as
+the BETWEEN datetime trap from Tier 1: runs fine, silently misclassifies.
+
+**Conditional aggregation: CASE inside an aggregate. (The pattern that matters most.)**
+Aggregates ignore NULLs. A CASE with no ELSE returns NULL for non-matching rows. Put the CASE inside the
+aggregate and it only sees the rows that matched. This computes a filtered aggregate inside a query that
+is not otherwise filtered, which WHERE cannot do because WHERE would remove those rows from the whole
+query. Lets several differently-filtered aggregates sit side by side in one grouped query.
+  `COUNT(CASE WHEN length > 120 THEN 1 END)` counts only the long films.
+The value after THEN is arbitrary. COUNT does not inspect it, only checks that it is not NULL.
+`THEN 1`, `THEN 'yes'`, `THEN film_id` all count the same rows. The `1` is convention, not requirement.
+
+**The ELSE decides whether non-matching rows are in the denominator.**
+COUNT wants them gone, so no ELSE. AVG needs them present as zeros, so ELSE 0.
+`AVG(CASE WHEN length > 120 THEN 1 ELSE 0 END)` gives the proportion, because a column of 1s and 0s
+averages to the proportion of 1s. Without the ELSE, AVG drops the NULLs, divides the sum of the 1s by the
+count of the 1s, and returns exactly 1.0 for every group. No error, just a wrong answer that looks valid.
+
+**CASE in ORDER BY for custom sort orders.**
+Ratings sort alphabetically as G, NC-17, PG, PG-13, R, which is meaningless. A CASE in the ORDER BY
+assigns each value a sort position and SQL sorts by that number instead. No ELSE means an unrecognized
+value returns NULL, and MySQL sorts NULLs first ascending, so it would silently jump to the top.
+
+**COALESCE(value, 0) is the shorthand for the NULL-to-zero CASE.**
+`COALESCE(a, b, 0)` returns the first non-NULL in the list. `COALESCE(SUM(x), 0)` replaces
+`CASE WHEN SUM(x) IS NULL THEN 0 ELSE SUM(x) END`. Idiomatic and appears constantly in real SQL.
 
 ---
 
 ## Tier 8: Set Operations
-*(to be filled as queries are written)*
+
+**UNION stacks rows vertically; JOIN adds columns horizontally.**
+Two full SELECT statements with UNION between them. One semicolon, at the very end. Both queries must
+return the same number of columns with compatible types. Column names come from the FIRST query only;
+an alias in the second query is ignored.
+
+**A SELECT list accepts literals, not just column names.**
+`SELECT first_name, 'staff' AS table_origin FROM staff` creates a column where every row holds 'staff'.
+Useful for tagging which source a row came from in a UNION. (Same idea as `THEN 1` inside a CASE.)
+
+**UNION deduplicates ENTIRE ROWS, not individual columns.**
+Two rows are duplicates only when every column matches. Adding a source-label literal guarantees rows
+from different halves can never match, which makes the dedup pass do nothing. Sakila staff+customer with
+a table_origin label returns 601 rows either way.
+
+**UNION vs UNION ALL: use UNION ALL by default.**
+UNION removes duplicates, which costs a sort or hash pass. UNION ALL keeps everything and skips that work.
+Most people reach for UNION reflexively and pay for a dedup they do not need. Only use UNION when you
+specifically want duplicates removed.
+
+**The distinction can change the answer dramatically.**
+customer_id from rental UNION ALL customer_id from payment returns 32,088 rows (16,044 rentals plus
+16,044 payments; ids repeat because customers transact many times). The same query with UNION returns 599,
+one per distinct customer. That 599 matches the customer table's row count, which means every customer has
+at least one rental and one payment. If it had returned 597, two customers never transacted. A real
+analytical finding hiding in a set operation.
+
+**UNION on a single column is SELECT DISTINCT in disguise.**
+It deduplicates across AND within both queries, making the whole combined result distinct. That free dedup
+is exactly why it is slower than UNION ALL.
 
 ---
 
 ## Tier 9: Synthesis
-*(to be filled as queries are written)*
+
+**Find the hub table first.**
+For "top-grossing category per country," payment is the anchor: it holds the measure being summed (amount)
+AND carries foreign keys to both directions needed (customer_id fans out to the country chain, rental_id
+fans out to the category chain). The hub is the table that owns the measure and the keys, not the one
+that is nearest to anything.
+
+**Trace both chains on paper before writing SQL.**
+customer -> address -> city -> country on one side. rental -> inventory -> film -> film_category ->
+category on the other. Nine joins total. Writing them out first is what makes the query writeable.
+
+**Join key errors run without erroring.**
+`city.city_id = address.address_id` compares a city id to an address id. Both are numbers, both exist, the
+query runs, the answer is garbage. The rule: join on the foreign key one table holds pointing at the
+other's primary key. Address holds city_id, so the join is `city.city_id = address.city_id`.
+
+**A column name matching what you want is not the same as meaning what you want. (The most valuable
+lesson in this tier.)**
+`customer.store_id` exists and is real, but it means the store the customer is REGISTERED at, one value,
+permanent. The question "how much did they spend AT that store" is about where the transaction physically
+happened, which lives in `inventory.store_id` (an inventory row is a physical copy sitting at a specific
+store). The correct chain is store -> inventory -> rental -> payment -> customer.
+  The tell: if a customer can only have one store_id, the question "how much at store 1 vs store 2" cannot
+  even be asked. When the question implies something the schema forbids, the column is wrong.
+  Checked empirically: the two store_ids frequently disagree, so customers do rent from both stores and
+  the customer.store_id path would attribute revenue to the wrong branch.
+  Habit: when two paths to the same concept exist, TEST whether they agree before picking one.
+
+**GROUP BY on names merges distinct people.**
+Grouping by first_name, last_name would combine two different customers who share a name. Group by
+customer_id and include the names alongside (they are functionally dependent on the id, so they add no
+extra groups).
+
+**Not every problem needs a CTE, and pattern trapping is real.**
+Q1 needed two chained CTEs because the steps are genuinely sequential: compute revenue per country-category,
+THEN rank it (and a window function cannot be filtered in the query that computes it). Q3 needed only one,
+for readability. The reflex to reach for CTEs because the last query used them leads to trying to stitch
+independent result sets together with a comma cross join, which produces garbage.
+  Test: can the inner query alone answer the question? If yes, the wrapper is redundant.
+
+**A single value does not need a CTE or a join. Use a scalar subquery.**
+A grand total is one number. `revenue / (SELECT SUM(amount) FROM payment) * 100` drops it directly into
+the expression, evaluating once. Same move as the Tier 4 scalar subquery in a WHERE clause; it works
+anywhere a value can go, including inside arithmetic in the SELECT.
+
+**You cannot reference a SELECT alias elsewhere in the same SELECT.**
+`SUM(amount) AS revenue` then `revenue / total` in the next line fails. Either repeat the expression, or
+put the aggregation in a CTE so revenue becomes a plain column the outer query can name.
+
+**To preserve a table at the far end of a chain, it has to be on the preserved side.**
+An inner join from payment out to category drops any category with zero payments, because there is no
+payment row for it to ride in on. A LEFT JOIN on category does nothing here for the same reason. RIGHT
+JOIN on category preserves it (or restructure to anchor FROM category and LEFT JOIN outward, which is
+the more conventional shape).
+
+**SUM over zero rows returns NULL, not 0.**
+And NULL propagates through arithmetic, so the percentage calculation also returns NULL. Wrap it:
+`COALESCE(SUM(amount), 0)`.
