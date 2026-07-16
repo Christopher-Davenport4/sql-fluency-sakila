@@ -1,16 +1,19 @@
-# Project 3: SQL Fluency Drilling — Sakila Dataset
+# SQL Analytics on a Relational Retail Database — Sakila
 
 ## Purpose
-This project exists for one reason: to build genuine SQL fluency through deliberate,
-repeated practice against a real relational schema. No Python, no dashboards, no pipeline.
-Just a database and a growing file of SQL queries.
 
-This is a direct response to an honest self-assessment. Prior projects involved JOINs,
-CTEs, and window functions once, with guidance, against a simple star schema where almost
-everything joined on a single key. That is familiarity, not fluency. This project is
-structured to close that gap: every query here was written by hand, without generated code,
-against a schema with genuinely complex relationships.
+This project exists to build genuine SQL fluency through deliberate, repeated practice
+against a real relational schema. No Python, no dashboards, no pipeline. Just a database
+and a growing file of SQL queries.
 
+The schema was chosen because it is hard. Sakila has 16 base tables, two many-to-many
+junction relationships, and a four-table geographic chain, which means most questions
+cannot be answered without multi-hop joins and a decision about which path through the
+schema is the correct one. Every query here was written by hand, without generated code.
+
+The work is organized into nine tiers, moving from single-table filtering through window
+functions and set operations. Tier 9 combines all of it, with three multi-construct
+queries answering business questions that require the full progression to reach.
 ---
 
 ## Dataset
